@@ -1,9 +1,9 @@
 # Finary MCP — standalone compose
-# Sits next to the obsidian-headless-mcp stack on Hostinger. Reuses the
-# Traefik instance from that stack (running with network_mode: host,
-# discovering containers via the Docker socket) — this stack does NOT
-# include its own Traefik. Traefik routes https://finary-mcp.${DOMAIN}
-# to this container via its bridge IP.
+# Designed for a Hostinger VPS using the Docker Manager template (n8n,
+# WordPress, etc.). The Hostinger-managed Traefik discovers services via
+# the Docker socket on containers joined to the external `traefik-proxy`
+# network, and routes https://finary-mcp.${DOMAIN} to this container with
+# a Let's Encrypt cert.
 #
 # Required .env vars: DOMAIN, FINARY_EMAIL, FINARY_PASSWORD, API_TOKEN
 
@@ -12,6 +12,8 @@ services:
     image: python:3.12-slim
     container_name: finary-mcp
     restart: unless-stopped
+    networks:
+      - traefik-proxy
     expose:
       - "3002"
     volumes:
@@ -34,10 +36,15 @@ services:
         exec(open('/tmp/finary_mcp.py').read())
     labels:
       - "traefik.enable=true"
+      - "traefik.docker.network=traefik-proxy"
       - "traefik.http.routers.finary-mcp.rule=Host(`finary-mcp.${DOMAIN}`)"
       - "traefik.http.routers.finary-mcp.entrypoints=websecure"
       - "traefik.http.routers.finary-mcp.tls.certresolver=letsencrypt"
       - "traefik.http.services.finary-mcp.loadbalancer.server.port=3002"
+
+networks:
+  traefik-proxy:
+    external: true
 
 volumes:
   finary-session:
