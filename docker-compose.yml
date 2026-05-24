@@ -29,7 +29,7 @@ services:
       python -c "
       import urllib.request, subprocess, sys;
       subprocess.run([sys.executable, '-m', 'pip', 'install', '--quiet', 'mcp', 'finary_uapi', 'pydantic', 'uvicorn'], check=True);
-      urllib.request.urlretrieve('https://raw.githubusercontent.com/seb7152/finary-mcp/main/finary-mcp/finary_mcp.py', '/tmp/finary_mcp.py');
+      urllib.request.urlretrieve('https://raw.githubusercontent.com/seb7152/finary-mcp/main/finary_mcp.py', '/tmp/finary_mcp.py');
       exec(open('/tmp/finary_mcp.py').read())
       "
     labels:
