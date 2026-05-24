@@ -116,15 +116,31 @@ class _FinaryClient:
             self._session = session
             return self._session
 
+    def _call(self, fn, *args, **kwargs):
+        """Call a finary_uapi function, retrying once on empty/non-JSON response.
+
+        Finary JWTs have a short TTL. finary_uapi's helpers call `.json()` blindly,
+        so a silent auth expiry surfaces as a `JSONDecodeError` on an empty body.
+        On that signal we invalidate the cached session, force `prepare_session()`
+        to refresh the JWT via Clerk (using the persisted cookies), and retry once.
+        """
+        try:
+            return fn(self._ensure_session(), *args, **kwargs)
+        except json.JSONDecodeError:
+            log.info("Finary returned non-JSON; refreshing session and retrying")
+            with self._lock:
+                self._session = None
+            return fn(self._ensure_session(), *args, **kwargs)
+
     # User / account ----------------------------------------------------
 
     def get_me(self) -> dict:
         from finary_uapi.user_me import get_user_me
-        return get_user_me(self._ensure_session())
+        return self._call(get_user_me)
 
     def get_holdings_accounts(self) -> dict:
         from finary_uapi.user_holdings_accounts import get_holdings_accounts
-        return get_holdings_accounts(self._ensure_session(), "")
+        return self._call(get_holdings_accounts, "")
 
     # Portfolio aggregates ----------------------------------------------
 
@@ -135,49 +151,49 @@ class _FinaryClient:
         if metric not in VALID_METRICS:
             raise ValueError(f"Invalid metric '{metric}'. Must be one of {sorted(VALID_METRICS)}.")
         api_metric = "finary" if metric == "finance" else metric
-        return get_portfolio_timeseries(self._ensure_session(), period, api_metric)
+        return self._call(get_portfolio_timeseries, period, api_metric)
 
     def get_dividends(self) -> dict:
         from finary_uapi.user_portfolio import get_portfolio_investments_dividends
-        return get_portfolio_investments_dividends(self._ensure_session())
+        return self._call(get_portfolio_investments_dividends)
 
     # Asset classes -----------------------------------------------------
 
     def get_investments(self) -> dict:
         from finary_uapi.user_securities import get_user_securities
-        return get_user_securities(self._ensure_session())
+        return self._call(get_user_securities)
 
     def get_cryptos(self) -> dict:
         from finary_uapi.user_cryptos import get_user_cryptos
-        return get_user_cryptos(self._ensure_session())
+        return self._call(get_user_cryptos)
 
     def get_scpis(self) -> dict:
         from finary_uapi.user_scpis import get_user_scpis
-        return get_user_scpis(self._ensure_session())
+        return self._call(get_user_scpis)
 
     def get_fonds_euro(self) -> dict:
         from finary_uapi.user_fonds_euro import get_user_fonds_euro
-        return get_user_fonds_euro(self._ensure_session())
+        return self._call(get_user_fonds_euro)
 
     def get_real_estates(self) -> dict:
         from finary_uapi.user_real_estates import get_user_real_estates
-        return get_user_real_estates(self._ensure_session())
+        return self._call(get_user_real_estates)
 
     def get_crowdlendings(self) -> dict:
         from finary_uapi.user_crowdlendings import get_user_crowdlendings
-        return get_user_crowdlendings(self._ensure_session())
+        return self._call(get_user_crowdlendings)
 
     def get_precious_metals(self) -> dict:
         from finary_uapi.user_precious_metals import get_user_precious_metals
-        return get_user_precious_metals(self._ensure_session())
+        return self._call(get_user_precious_metals)
 
     def get_generic_assets(self) -> dict:
         from finary_uapi.user_generic_assets import get_user_generic_assets
-        return get_user_generic_assets(self._ensure_session())
+        return self._call(get_user_generic_assets)
 
     def get_startups(self) -> dict:
         from finary_uapi.user_startups import get_user_startups
-        return get_user_startups(self._ensure_session())
+        return self._call(get_user_startups)
 
 
 _client = _FinaryClient()
@@ -285,6 +301,13 @@ def _handle_error(e: Exception) -> str:
             "Error: Finary authentication failed. The session cookie may have expired. "
             "Call the finary_signin tool to refresh it (it will ask for an MFA "
             "code if 2FA is enabled on the account)."
+        )
+    if isinstance(e, json.JSONDecodeError):
+        # finary_uapi calls .json() blindly; if the API returns an empty body
+        # (typically a silent auth failure) we surface a clear hint.
+        return (
+            "Error: Finary returned an empty/non-JSON response. The session likely "
+            "expired silently. Call the finary_signin tool to refresh it."
         )
     log.exception("Tool execution failed")
     return f"Error: {type(e).__name__}: {e}"
