@@ -25,13 +25,14 @@ services:
     # Same bootstrap pattern as obsidian-mcp: pip install deps, fetch the
     # latest finary_mcp.py from GitHub, exec it. `docker compose restart`
     # = update to whatever's on main.
-    command: >
-      python -c "
-      import urllib.request, subprocess, sys;
-      subprocess.run([sys.executable, '-m', 'pip', 'install', '--quiet', 'mcp', 'finary_uapi', 'pydantic', 'uvicorn'], check=True);
-      urllib.request.urlretrieve('https://raw.githubusercontent.com/seb7152/finary-mcp/main/finary_mcp.py', '/tmp/finary_mcp.py');
-      exec(open('/tmp/finary_mcp.py').read())
-      "
+    command:
+      - python
+      - -c
+      - |
+        import urllib.request, subprocess, sys
+        subprocess.run([sys.executable, '-m', 'pip', 'install', '--quiet', 'mcp', 'finary_uapi', 'pydantic', 'uvicorn'], check=True)
+        urllib.request.urlretrieve('https://raw.githubusercontent.com/seb7152/finary-mcp/main/finary_mcp.py', '/tmp/finary_mcp.py')
+        exec(open('/tmp/finary_mcp.py').read())
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.finary-mcp.rule=Host(`finary-mcp.${DOMAIN}`)"
