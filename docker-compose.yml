@@ -1,9 +1,10 @@
 # Finary MCP — standalone compose
-# Sits next to the obsidian-headless-mcp stack on Hostinger. Reuses the
-# existing Traefik (running with network_mode: host in the obsidian stack) —
-# this stack therefore does NOT include its own Traefik. The existing one
-# discovers this container via the Docker socket and routes
-# https://finary-mcp.${DOMAIN} to it.
+# Sits next to other Docker Compose projects on Hostinger VPS. Reuses the
+# Traefik instance deployed by Hostinger Docker Manager — this stack does NOT
+# include its own Traefik. The container joins the external `traefik-proxy`
+# network so Traefik discovers it via the Docker socket and routes
+# https://finary-mcp.${DOMAIN} to it (Let's Encrypt cert via the `letsencrypt`
+# resolver configured on the Hostinger Traefik).
 #
 # Required .env vars: DOMAIN, FINARY_EMAIL, FINARY_PASSWORD, API_TOKEN
 
@@ -12,6 +13,8 @@ services:
     image: python:3.12-slim
     container_name: finary-mcp
     restart: unless-stopped
+    networks:
+      - traefik-proxy
     expose:
       - "3002"
     volumes:
@@ -22,9 +25,8 @@ services:
       - FINARY_EMAIL=${FINARY_EMAIL}
       - FINARY_PASSWORD=${FINARY_PASSWORD}
       - FINARY_SESSION_DIR=/data
-    # Same bootstrap pattern as obsidian-mcp: pip install deps, fetch the
-    # latest finary_mcp.py from GitHub, exec it. `docker compose restart`
-    # = update to whatever's on main.
+    # Bootstrap: pip install deps, fetch the latest finary_mcp.py from
+    # GitHub, exec it. `docker compose restart` = update to whatever's on main.
     command:
       - python
       - -c
@@ -35,10 +37,15 @@ services:
         exec(open('/tmp/finary_mcp.py').read())
     labels:
       - "traefik.enable=true"
+      - "traefik.docker.network=traefik-proxy"
       - "traefik.http.routers.finary-mcp.rule=Host(`finary-mcp.${DOMAIN}`)"
       - "traefik.http.routers.finary-mcp.entrypoints=websecure"
       - "traefik.http.routers.finary-mcp.tls.certresolver=letsencrypt"
       - "traefik.http.services.finary-mcp.loadbalancer.server.port=3002"
+
+networks:
+  traefik-proxy:
+    external: true
 
 volumes:
   finary-session:
