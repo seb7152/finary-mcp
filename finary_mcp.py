@@ -276,10 +276,34 @@ def _to_list(payload: Any) -> list:
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
-        for key in ("data", "items", "results", "assets"):
+        for key in ("data", "items", "results", "assets", "timeseries"):
             if key in data and isinstance(data[key], list):
                 return data[key]
     return []
+
+
+def _normalize_timeseries(payload: Any) -> list[dict]:
+    """Normalize a Finary timeseries payload to a list of {date, value} dicts.
+
+    Finary returns `{"result": {"timeseries": [[iso_date, breakdown], ...]}}` where
+    `breakdown` is a dict with one sub-dict per asset class plus a "total" sub-dict
+    holding the aggregate `amount` for the requested metric.
+    """
+    raw = _to_list(payload)
+    points: list[dict] = []
+    for entry in raw:
+        if isinstance(entry, (list, tuple)) and len(entry) == 2:
+            date, breakdown = entry
+            if isinstance(breakdown, dict):
+                total = breakdown.get("total")
+                value = total.get("amount") if isinstance(total, dict) else None
+                points.append({"date": date, "value": value})
+        elif isinstance(entry, dict):
+            points.append({
+                "date": _pick(entry, "date", "timestamp", "x"),
+                "value": _pick(entry, "value", "amount", "y"),
+            })
+    return points
 
 
 def _pick(item: dict, *keys: str) -> Any:
@@ -363,19 +387,18 @@ def _render_dividends(payload: Any) -> str:
 
 
 def _render_timeseries(payload: Any) -> str:
-    series = _to_list(payload)
+    series = _normalize_timeseries(payload)
     if not series:
         return "# Historique\n\n_Aucune donnée._"
     first, last = series[0], series[-1]
-    first_val = _pick(first, "value", "amount", "y")
-    last_val = _pick(last, "value", "amount", "y")
+    first_val, last_val = first["value"], last["value"]
     delta = None
     if isinstance(first_val, (int, float)) and isinstance(last_val, (int, float)) and first_val:
         delta = (last_val - first_val) / first_val * 100
     return "\n".join([
         "# Historique de patrimoine\n",
-        f"- **Du** : {_pick(first, 'date', 'timestamp', 'x')}",
-        f"- **Au** : {_pick(last, 'date', 'timestamp', 'x')}",
+        f"- **Du** : {first['date']}",
+        f"- **Au** : {last['date']}",
         f"- **Valeur initiale** : {_fmt_eur(first_val)}",
         f"- **Valeur finale** : {_fmt_eur(last_val)}",
         f"- **Évolution** : {_fmt_pct(delta) if delta is not None else 'n/a'}",
@@ -384,12 +407,11 @@ def _render_timeseries(payload: Any) -> str:
 
 
 def _render_net_worth(payload: Any, label: str) -> str:
-    series = _to_list(payload)
+    series = _normalize_timeseries(payload)
     if not series:
         return f"# {label}\n\n_Aucune donnée._"
     last = series[-1]
-    last_val = _pick(last, "value", "amount", "y")
-    first_val = _pick(series[0], "value", "amount", "y")
+    first_val, last_val = series[0]["value"], last["value"]
     delta = None
     if isinstance(first_val, (int, float)) and isinstance(last_val, (int, float)) and first_val:
         delta = (last_val - first_val) / first_val * 100
@@ -397,7 +419,7 @@ def _render_net_worth(payload: Any, label: str) -> str:
         f"# {label}\n",
         f"**Valeur actuelle** : {_fmt_eur(last_val)}",
         f"**Variation sur la période** : {_fmt_pct(delta) if delta is not None else 'n/a'}",
-        f"**Dernier point** : {_pick(last, 'date', 'timestamp', 'x')}",
+        f"**Dernier point** : {last['date']}",
     ])
 
 
@@ -648,11 +670,18 @@ async def finary_get_user_info(params: EmptyInput) -> str:
         if params.response_format == ResponseFormat.JSON:
             return json.dumps(data, indent=2, ensure_ascii=False, default=str)
         u = _unwrap(data)
-        plan = u.get("plan") if isinstance(u, dict) else None
+        if not isinstance(u, dict) or not u:
+            return (
+                "Error: Finary returned an empty profile for /users/me. "
+                "The session likely expired silently. Call the finary_signin tool "
+                "to refresh it."
+            )
+        plan = u.get("plan")
         plan_name = plan.get("name") if isinstance(plan, dict) else plan or "n/a"
+        full_name = f"{u.get('first_name') or ''} {u.get('last_name') or ''}".strip() or "n/a"
         return (
             "# Profil Finary\n\n"
-            f"- **Nom** : {u.get('first_name', '')} {u.get('last_name', '')}\n"
+            f"- **Nom** : {full_name}\n"
             f"- **Email** : {u.get('email', 'n/a')}\n"
             f"- **Plan** : {plan_name}\n"
         )
