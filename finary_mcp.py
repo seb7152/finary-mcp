@@ -283,7 +283,8 @@ def _handle_error(e: Exception) -> str:
     if isinstance(e, FinaryAuthError):
         return (
             "Error: Finary authentication failed. The session cookie may have expired. "
-            "Re-run signin inside the container."
+            "Call the finary_signin tool to refresh it (it will ask for an MFA "
+            "code if 2FA is enabled on the account)."
         )
     log.exception("Tool execution failed")
     return f"Error: {type(e).__name__}: {e}"
@@ -391,6 +392,59 @@ def _render_overview(summary: dict) -> str:
         for err in summary["errors"]:
             lines.append(f"- {err}")
     return "\n".join(lines)
+
+
+class SigninInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    otp_code: str = Field(
+        default="",
+        description="6-digit TOTP code from your authenticator app. Leave empty on the first call to discover whether MFA is required.",
+    )
+
+
+# ===========================================================================
+# TOOLS — Auth
+# ===========================================================================
+
+
+@mcp.tool(
+    name="finary_signin",
+    annotations={
+        "title": "Sign in to Finary (refresh expired session)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def finary_signin(params: SigninInput) -> str:
+    """Refresh the Finary session by signing in with the configured credentials.
+
+    Call without otp_code first. If the response asks for an OTP, ask the user
+    for their 6-digit TOTP code (from their authenticator app) and call again
+    with otp_code set. On success, cookies are persisted to /data/cookies.json
+    and the in-memory session is reset so subsequent tools use the new auth.
+    """
+    from finary_uapi.signin import signin as _signin
+
+    os.makedirs(FINARY_SESSION_DIR, exist_ok=True)
+    os.chdir(FINARY_SESSION_DIR)
+    try:
+        _signin(params.otp_code)
+    except RuntimeError as e:
+        msg = str(e)
+        if "OTP code is required" in msg:
+            return (
+                "MFA required. Ask the user for their 6-digit TOTP code from "
+                "their authenticator app, then call finary_signin again with "
+                "otp_code set."
+            )
+        return f"Sign-in failed: {msg}"
+    except Exception as e:  # noqa: BLE001
+        return f"Sign-in failed: {type(e).__name__}: {e}"
+
+    _client._session = None
+    return "Signed in. Session cookies refreshed; all other tools are now usable."
 
 
 # ===========================================================================
