@@ -1,0 +1,44 @@
+# Finary MCP — standalone compose
+# Sits next to the obsidian-headless-mcp stack on Hostinger. Reuses the
+# existing Traefik (running with network_mode: host in the obsidian stack) —
+# this stack therefore does NOT include its own Traefik. The existing one
+# discovers this container via the Docker socket and routes
+# https://finary-mcp.${DOMAIN} to it.
+#
+# Required .env vars: DOMAIN, FINARY_EMAIL, FINARY_PASSWORD, API_TOKEN
+
+services:
+  finary-mcp:
+    image: python:3.12-slim
+    container_name: finary-mcp
+    restart: unless-stopped
+    expose:
+      - "3002"
+    volumes:
+      - finary-session:/data
+    environment:
+      - PORT=3002
+      - API_TOKEN=${API_TOKEN}
+      - FINARY_EMAIL=${FINARY_EMAIL}
+      - FINARY_PASSWORD=${FINARY_PASSWORD}
+      - FINARY_SESSION_DIR=/data
+    # Same bootstrap pattern as obsidian-mcp: pip install deps, fetch the
+    # latest finary_mcp.py from GitHub, exec it. `docker compose restart`
+    # = update to whatever's on main.
+    command: >
+      python -c "
+      import urllib.request, subprocess, sys;
+      subprocess.run([sys.executable, '-m', 'pip', 'install', '--quiet',
+        'mcp', 'finary_uapi', 'pydantic', 'uvicorn'], check=True);
+      urllib.request.urlretrieve('https://raw.githubusercontent.com/seb7152/finary-mcp/main/finary_mcp.py', '/tmp/finary_mcp.py');
+      exec(open('/tmp/finary_mcp.py').read())
+      "
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.finary-mcp.rule=Host(`finary-mcp.${DOMAIN}`)"
+      - "traefik.http.routers.finary-mcp.entrypoints=websecure"
+      - "traefik.http.routers.finary-mcp.tls.certresolver=letsencrypt"
+      - "traefik.http.services.finary-mcp.loadbalancer.server.port=3002"
+
+volumes:
+  finary-session:
