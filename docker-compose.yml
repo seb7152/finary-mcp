@@ -1,9 +1,10 @@
 # Finary MCP — standalone compose
-# Designed for a Hostinger VPS using the Docker Manager template (n8n,
-# WordPress, etc.). The Hostinger-managed Traefik discovers services via
-# the Docker socket on containers joined to the external `traefik-proxy`
-# network, and routes https://finary-mcp.${DOMAIN} to this container with
-# a Let's Encrypt cert.
+# Designed to sit next to the Hostinger n8n template on the same VPS.
+# That template deploys its own Traefik in a compose project named `root`
+# (containers root-traefik-1, root-n8n-1) with cert resolver `mytlschallenge`.
+# This stack joins the external `root_default` network so that Traefik
+# discovers this container via the Docker socket and routes
+# https://finary-mcp.${DOMAIN} to it with a Let's Encrypt cert.
 #
 # Required .env vars: DOMAIN, FINARY_EMAIL, FINARY_PASSWORD, API_TOKEN
 
@@ -13,7 +14,7 @@ services:
     container_name: finary-mcp
     restart: unless-stopped
     networks:
-      - traefik-proxy
+      - root_default
     expose:
       - "3002"
     volumes:
@@ -36,14 +37,14 @@ services:
         exec(open('/tmp/finary_mcp.py').read())
     labels:
       - "traefik.enable=true"
-      - "traefik.docker.network=traefik-proxy"
+      - "traefik.docker.network=root_default"
       - "traefik.http.routers.finary-mcp.rule=Host(`finary-mcp.${DOMAIN}`)"
       - "traefik.http.routers.finary-mcp.entrypoints=websecure"
-      - "traefik.http.routers.finary-mcp.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.finary-mcp.tls.certresolver=mytlschallenge"
       - "traefik.http.services.finary-mcp.loadbalancer.server.port=3002"
 
 networks:
-  traefik-proxy:
+  root_default:
     external: true
 
 volumes:
