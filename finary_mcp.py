@@ -142,6 +142,24 @@ class _FinaryClient:
         from finary_uapi.user_holdings_accounts import get_holdings_accounts
         return self._call(get_holdings_accounts, "")
 
+    def get_checking_accounts_transactions(
+        self,
+        page: int = 1,
+        per_page: int = 50,
+        query: str = "",
+        account_id: str = "",
+        institution_id: str = "",
+    ) -> dict:
+        from finary_uapi.user_portfolio import get_portfolio_checking_accounts_transactions
+        return self._call(
+            get_portfolio_checking_accounts_transactions,
+            page,
+            per_page,
+            query,
+            account_id,
+            institution_id,
+        )
+
     # Portfolio aggregates ----------------------------------------------
 
     def get_timeseries(self, period: str, metric: str) -> dict:
@@ -366,6 +384,33 @@ def _render_account_like(items: list, title: str) -> str:
     return "\n".join(lines)
 
 
+def _render_transactions(payload: Any) -> str:
+    items = _to_list(payload)
+    if not items:
+        return "# Transactions\n\n_Aucune transaction._"
+    lines = [
+        "# Transactions comptes courants\n",
+        "| Date | Libellé | Compte | Catégorie | Montant |",
+        "| --- | --- | --- | --- | ---: |",
+    ]
+    total = 0.0
+    for t in items:
+        date = _pick(t, "date", "transaction_date", "value_date") or ""
+        label = _pick(t, "name", "label", "description", "wording") or "?"
+        account = t.get("account") if isinstance(t.get("account"), dict) else {}
+        account_name = account.get("name") if account else _pick(t, "account_name") or ""
+        cat = t.get("category") if isinstance(t.get("category"), dict) else {}
+        cat_name = cat.get("name") if cat else _pick(t, "category_name") or ""
+        amount = _pick(t, "amount", "display_amount", "value")
+        try:
+            total += float(amount)
+        except (TypeError, ValueError):
+            pass
+        lines.append(f"| {date} | {label} | {account_name} | {cat_name} | {_fmt_eur(amount)} |")
+    lines.append(f"\n**Total** ({len(items)} transactions) : {_fmt_eur(total)}")
+    return "\n".join(lines)
+
+
 def _render_dividends(payload: Any) -> str:
     items = _to_list(payload)
     if not items:
@@ -437,6 +482,31 @@ def _render_overview(summary: dict) -> str:
         for err in summary["errors"]:
             lines.append(f"- {err}")
     return "\n".join(lines)
+
+
+class TransactionsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    page: int = Field(
+        default=1,
+        description="Page number (1-based). Use -1 to fetch all pages.",
+    )
+    perpage: int = Field(
+        default=50,
+        description="Items per page (default 50).",
+    )
+    account_ids: str = Field(
+        default="",
+        description="Filter by holding account id(s). Comma-separated for multiple.",
+    )
+    institution_ids: str = Field(
+        default="",
+        description="Filter by institution id(s). Comma-separated for multiple.",
+    )
+    query: str = Field(
+        default="",
+        description="Free-text search on transaction labels.",
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 
 class SigninInput(BaseModel):
@@ -800,6 +870,51 @@ async def finary_get_upcoming_dividends(params: EmptyInput) -> str:
     try:
         data = _client.get_dividends()
         return _format_response(data, params.response_format, _render_dividends)
+    except Exception as e:  # noqa: BLE001
+        return _handle_error(e)
+
+
+# ===========================================================================
+# TOOLS — Transactions
+# ===========================================================================
+
+
+@mcp.tool(
+    name="finary_get_transactions",
+    annotations={
+        "title": "Get checking account transactions",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def finary_get_transactions(params: TransactionsInput) -> str:
+    """List transactions across connected checking (current) accounts.
+
+    Supports pagination and filtering by account, institution or free-text query.
+
+    Args:
+        params:
+            - page: page number (1-based), or -1 to fetch all pages
+            - perpage: items per page (default 50)
+            - account_ids: filter by holding account id(s), comma-separated
+            - institution_ids: filter by institution id(s), comma-separated
+            - query: free-text search on transaction labels
+            - response_format: 'markdown' | 'json'
+
+    Returns:
+        Markdown table of transactions or full JSON payload.
+    """
+    try:
+        data = _client.get_checking_accounts_transactions(
+            page=params.page,
+            per_page=params.perpage,
+            query=params.query,
+            account_id=params.account_ids,
+            institution_id=params.institution_ids,
+        )
+        return _format_response(data, params.response_format, _render_transactions)
     except Exception as e:  # noqa: BLE001
         return _handle_error(e)
 
