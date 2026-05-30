@@ -1679,12 +1679,18 @@ def _render_evolution_value(series: list[dict], meta: dict) -> str:
     },
 )
 async def finary_get_evolution_value(params: EvolutionValueInput) -> str:
-    """Chart the market-price evolution of a listed security over a horizon (yfinance).
+    """Market-price evolution / backtest of a listed security over a horizon (yfinance, Yahoo Finance).
 
-    Pulls the historical price from Yahoo Finance and multiplies it by a constant
-    quantity (the Finary position's current quantity by default) to get a value
-    "backtest". Give either a Finary `query` (ticker/ISIN/name — quantity and
-    identifiers are taken from the held position) or an explicit Yahoo `ticker`.
+    Charts the historical price (price history) of a listed holding and multiplies
+    it by a constant quantity (the Finary position's current quantity by default)
+    to get a value "backtest". Give either a Finary `query` (ticker/ISIN/name —
+    quantity and identifiers are taken from the held position) or an explicit
+    Yahoo `ticker`.
+
+    IMPORTANT — constant-quantity backtest: the *current* quantity is applied to
+    the whole history; past buys/sells are NOT taken into account, so historical
+    values are approximate if the position size changed over time. Only what the
+    instrument would be worth at past market prices given today's quantity.
 
     Only works for listed instruments (stocks, ETFs, listed funds, crypto). Bonds,
     money-market/structured funds that aren't on Yahoo can't be resolved and return
