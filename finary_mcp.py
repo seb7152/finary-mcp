@@ -373,7 +373,10 @@ def _render_account_like(items: list, title: str) -> str:
             "display_current_value", "current_value",
             "display_balance", "balance", "amount", "user_estimated_value",
         ))
-        perf = _pick(item, "display_diff_gain", "performance", "variation_percentage")
+        perf = _pick(
+            item, "display_diff_gain", "performance", "variation_percentage",
+            "current_upnl_percent", "unrealized_pnl_percent", "evolution_percent",
+        )
         try:
             total += float(value)
         except (TypeError, ValueError):
@@ -1107,6 +1110,7 @@ def _group_matches(records, query: str, match_by: MatchBy) -> list:
             "perf": _amount(_pick(
                 pos, "display_unrealized_performance", "display_diff_gain",
                 "performance", "variation_percentage",
+                "current_upnl_percent", "unrealized_pnl_percent", "evolution_percent",
             )),
         })
     return [groups[k] for k in order]
@@ -1275,6 +1279,7 @@ def _group_by_account(records, query: str) -> list:
             "perf": _amount(_pick(
                 pos, "display_unrealized_performance", "display_diff_gain",
                 "performance", "variation_percentage",
+                "current_upnl_percent", "unrealized_pnl_percent", "evolution_percent",
             )),
         })
     return [groups[k] for k in order]
