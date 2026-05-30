@@ -920,6 +920,448 @@ async def finary_get_transactions(params: TransactionsInput) -> str:
 
 
 # ===========================================================================
+# TOOLS — Position lookup (find a holding by ticker / ISIN / name)
+# ===========================================================================
+
+
+class MatchBy(str, Enum):
+    AUTO = "auto"
+    TICKER = "ticker"
+    ISIN = "isin"
+    NAME = "name"
+
+
+class PositionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    query: str = Field(
+        description="Ticker/symbol, ISIN, or (part of) a name to look up. "
+        "Examples: 'SPOT', 'US85207U1043', 'Spotify'.",
+    )
+    match_by: MatchBy = Field(
+        default=MatchBy.AUTO,
+        description=(
+            "How to interpret `query`. 'auto' (default) matches an exact ticker or "
+            "ISIN, or a substring of the ticker/name. 'ticker'/'isin' force an exact "
+            "identifier match; 'name' forces a case-insensitive substring on the name."
+        ),
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+
+# Sub-objects that, when present on a position, carry the instrument identity.
+_INSTRUMENT_SUBKEYS = ("security", "crypto", "fonds_euro", "scpi", "precious_metal", "asset")
+
+
+def _amount(value: Any) -> Any:
+    """Finary sometimes wraps a monetary value in a dict ({eur, display, ...})."""
+    if isinstance(value, dict):
+        return _pick(value, "eur", "value", "amount")
+    return value
+
+
+def _fmt_qty(value: Any) -> str:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return str(value) if value is not None else "—"
+    if f == int(f):
+        return f"{int(f):,}".replace(",", " ")
+    return f"{f:,.6f}".replace(",", " ").replace(".", ",").rstrip("0").rstrip(",")
+
+
+def _position_identity(pos: dict) -> tuple:
+    """Return (symbol, isin, name, instrument_dict) for a position.
+
+    A position usually nests its instrument under one of `_INSTRUMENT_SUBKEYS`;
+    some flat endpoints expose the identity fields directly on the position.
+    """
+    instrument = None
+    for k in _INSTRUMENT_SUBKEYS:
+        v = pos.get(k)
+        if isinstance(v, dict):
+            instrument = v
+            break
+    src = instrument if instrument is not None else pos
+    symbol = _pick(src, "symbol", "ticker", "code")
+    isin = _pick(src, "isin")
+    name = _pick(src, "name", "display_name", "fullname")
+    return symbol, isin, name, instrument
+
+
+def _account_meta(acc: dict) -> dict:
+    inst = acc.get("institution") if isinstance(acc.get("institution"), dict) else {}
+    return {
+        "institution": (inst.get("name") if inst else None) or _pick(acc, "institution_name"),
+        "account": _pick(acc, "name", "display_name") or "?",
+        "account_id": acc.get("id"),
+    }
+
+
+def _iter_account_positions(holdings_payload: Any):
+    """Yield position records (with institution/account context) from holdings_accounts.
+
+    Walks every list-valued field of each account and keeps items that expose an
+    instrument identity (a nested security/crypto/... sub-object, or a direct
+    symbol/ISIN). This stays resilient to Finary renaming its per-class arrays.
+    """
+    for acc in _to_list(holdings_payload):
+        if not isinstance(acc, dict):
+            continue
+        meta = _account_meta(acc)
+        for key, val in acc.items():
+            if not isinstance(val, list):
+                continue
+            for item in val:
+                if not isinstance(item, dict):
+                    continue
+                symbol, isin, name, instrument = _position_identity(item)
+                if instrument is None and not symbol and not isin:
+                    continue
+                yield {
+                    **meta, "kind": key, "position": item,
+                    "symbol": symbol, "isin": isin, "name": name,
+                }
+
+
+def _iter_flat_positions():
+    """Fallback: walk the flat securities/cryptos endpoints when holdings_accounts
+    does not nest positions. Institution/account context is taken from the item
+    itself when available."""
+    sources = [("securities", _client.get_investments), ("cryptos", _client.get_cryptos)]
+    for kind, fn in sources:
+        try:
+            items = _to_list(fn())
+        except Exception:  # noqa: BLE001
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            symbol, isin, name, instrument = _position_identity(item)
+            if instrument is None and not symbol and not isin:
+                continue
+            acc = item.get("account") if isinstance(item.get("account"), dict) else {}
+            if not acc and isinstance(item.get("holding_account"), dict):
+                acc = item["holding_account"]
+            meta = _account_meta(acc) if acc else {"institution": None, "account": "?", "account_id": None}
+            yield {**meta, "kind": kind, "position": item,
+                   "symbol": symbol, "isin": isin, "name": name}
+
+
+def _position_matches(query: str, match_by: MatchBy, symbol, isin, name) -> bool:
+    q = query.strip().lower()
+    if not q:
+        return False
+    sym = (symbol or "").lower()
+    isn = (isin or "").lower()
+    nm = (name or "").lower()
+    if match_by == MatchBy.TICKER:
+        return q == sym
+    if match_by == MatchBy.ISIN:
+        return q == isn
+    if match_by == MatchBy.NAME:
+        return q in nm
+    # auto: exact ticker/ISIN, else substring on ticker or name
+    return q == sym or q == isn or q in sym or q in nm
+
+
+def _group_matches(records, query: str, match_by: MatchBy) -> list:
+    """Filter records by the query and group them per instrument (so the same
+    ticker held in several accounts is collapsed into one entry)."""
+    groups: dict = {}
+    order: list = []
+    for rec in records:
+        if not _position_matches(query, match_by, rec["symbol"], rec["isin"], rec["name"]):
+            continue
+        key = (rec["isin"] or "").lower() or (rec["symbol"] or "").lower() or (rec["name"] or "").lower()
+        if key not in groups:
+            groups[key] = {"name": rec["name"], "symbol": rec["symbol"], "isin": rec["isin"], "rows": []}
+            order.append(key)
+        pos = rec["position"]
+        groups[key]["rows"].append({
+            "institution": rec["institution"],
+            "account": rec["account"],
+            "account_id": rec["account_id"],
+            "kind": rec["kind"],
+            "quantity": _pick(pos, "quantity", "shares", "units"),
+            "value": _amount(_pick(
+                pos, "display_current_value", "current_value", "display_value",
+                "value", "amount", "display_balance", "balance",
+            )),
+            "buying": _amount(_pick(pos, "display_buying_price", "buying_price")),
+            "perf": _amount(_pick(
+                pos, "display_unrealized_performance", "display_diff_gain",
+                "performance", "variation_percentage",
+            )),
+        })
+    return [groups[k] for k in order]
+
+
+def _render_positions(groups: list, query: str) -> str:
+    if not groups:
+        return (
+            f"# Position « {query} »\n\n"
+            "_Aucune position trouvée._ Vérifiez le ticker/ISIN/nom, ou réessayez "
+            "avec `match_by='name'` pour une recherche partielle sur le nom."
+        )
+    out: list[str] = []
+    for g in groups:
+        header = g["name"] or g["symbol"] or g["isin"] or "?"
+        ident_bits = []
+        if g["symbol"]:
+            ident_bits.append(f"ticker `{g['symbol']}`")
+        if g["isin"]:
+            ident_bits.append(f"ISIN `{g['isin']}`")
+        out.append(f"## {header}" + (f" — {', '.join(ident_bits)}" if ident_bits else ""))
+        out.append("")
+        out.append("| Institution | Compte | Quantité | Valeur | PRU | Perf. |")
+        out.append("| --- | --- | ---: | ---: | ---: | ---: |")
+        total_qty = 0.0
+        total_val = 0.0
+        for r in g["rows"]:
+            try:
+                total_qty += float(r["quantity"])
+            except (TypeError, ValueError):
+                pass
+            try:
+                total_val += float(r["value"])
+            except (TypeError, ValueError):
+                pass
+            buying = _fmt_eur(r["buying"]) if r["buying"] is not None else "—"
+            perf = _fmt_pct(r["perf"]) if r["perf"] is not None else "—"
+            out.append(
+                f"| {r['institution'] or '—'} | {r['account']} | {_fmt_qty(r['quantity'])} | "
+                f"{_fmt_eur(r['value'])} | {buying} | {perf} |"
+            )
+        if len(g["rows"]) > 1:
+            out.append(
+                f"| **Total** | {len(g['rows'])} compte(s) | **{_fmt_qty(total_qty)}** | "
+                f"**{_fmt_eur(total_val)}** | | |"
+            )
+        out.append("")
+    return "\n".join(out).rstrip()
+
+
+@mcp.tool(
+    name="finary_get_position",
+    annotations={
+        "title": "Find a position by ticker / ISIN / name",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def finary_get_position(params: PositionInput) -> str:
+    """Find a single holding (a "position") by ticker, ISIN or name, across every account.
+
+    This avoids downloading the whole portfolio: it fetches the holdings once,
+    filters server-side, and returns only the matching position(s) — so it stays
+    cheap in tokens. An instrument held in several accounts (e.g. SPOT on both
+    IBKR and Trade Republic) is grouped together, with a per-account breakdown
+    (institution, account, quantity, value, average buying price, performance)
+    and aggregated totals.
+
+    Args:
+        params:
+            - query: ticker (e.g. 'SPOT'), ISIN (e.g. 'US85207U1043') or name ('Spotify').
+            - match_by: 'auto' (default), 'ticker', 'isin' or 'name'.
+            - response_format: 'markdown' (default) or 'json'.
+
+    Returns:
+        Markdown breakdown grouped per instrument, or the matching positions as JSON.
+    """
+    try:
+        records = list(_iter_account_positions(_client.get_holdings_accounts()))
+        # Fallback for portfolios where holdings_accounts does not nest positions.
+        if not records:
+            records = list(_iter_flat_positions())
+        groups = _group_matches(records, params.query, params.match_by)
+        if params.response_format == ResponseFormat.JSON:
+            payload = [
+                {
+                    "name": g["name"], "symbol": g["symbol"], "isin": g["isin"],
+                    "accounts_count": len(g["rows"]),
+                    "total_quantity": sum(
+                        float(r["quantity"]) for r in g["rows"]
+                        if isinstance(r["quantity"], (int, float))
+                    ),
+                    "total_value": sum(
+                        float(r["value"]) for r in g["rows"]
+                        if isinstance(r["value"], (int, float))
+                    ),
+                    "positions": [
+                        {
+                            "institution": r["institution"], "account": r["account"],
+                            "account_id": r["account_id"], "kind": r["kind"],
+                            "quantity": r["quantity"], "value": r["value"],
+                            "buying_price": r["buying"], "performance": r["perf"],
+                        }
+                        for r in g["rows"]
+                    ],
+                }
+                for g in groups
+            ]
+            return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+        return _render_positions(groups, params.query)
+    except Exception as e:  # noqa: BLE001
+        return _handle_error(e)
+
+
+# ===========================================================================
+# TOOLS — Account / portfolio lookup (all holdings of one account or broker)
+# ===========================================================================
+
+
+class AccountInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    query: str = Field(
+        description="Account name, account id, or institution name to fetch. "
+        "Examples: 'IBKR', 'Interactive Brokers', 'Trade Republic', 'PEA'.",
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+
+def _account_query_matches(query: str, meta: dict) -> bool:
+    q = query.strip().lower()
+    if not q:
+        return False
+    inst = (meta.get("institution") or "").lower()
+    acc = (meta.get("account") or "").lower()
+    acc_id = str(meta.get("account_id") or "").lower()
+    return q == acc_id or q in inst or q in acc
+
+
+def _group_by_account(records, query: str) -> list:
+    """Keep records whose account/institution matches the query and group them
+    per account (so 'IBKR' returns every line held in the IBKR account(s))."""
+    groups: dict = {}
+    order: list = []
+    for rec in records:
+        if not _account_query_matches(query, rec):
+            continue
+        key = str(rec.get("account_id") or "") or f"{rec['institution']}|{rec['account']}"
+        if key not in groups:
+            groups[key] = {
+                "institution": rec["institution"], "account": rec["account"],
+                "account_id": rec["account_id"], "rows": [],
+            }
+            order.append(key)
+        pos = rec["position"]
+        groups[key]["rows"].append({
+            "name": rec["name"], "symbol": rec["symbol"], "isin": rec["isin"],
+            "kind": rec["kind"],
+            "quantity": _pick(pos, "quantity", "shares", "units"),
+            "value": _amount(_pick(
+                pos, "display_current_value", "current_value", "display_value",
+                "value", "amount", "display_balance", "balance",
+            )),
+            "buying": _amount(_pick(pos, "display_buying_price", "buying_price")),
+            "perf": _amount(_pick(
+                pos, "display_unrealized_performance", "display_diff_gain",
+                "performance", "variation_percentage",
+            )),
+        })
+    return [groups[k] for k in order]
+
+
+def _render_accounts(groups: list, query: str) -> str:
+    if not groups:
+        return (
+            f"# Portefeuille « {query} »\n\n"
+            "_Aucun compte correspondant._ Essayez le nom de l'institution "
+            "(ex. 'Interactive Brokers') ou utilisez `finary_list_holdings_accounts` "
+            "pour voir les comptes disponibles."
+        )
+    out: list[str] = []
+    for g in groups:
+        title = " — ".join(x for x in (g["institution"], g["account"]) if x) or "?"
+        out.append(f"## {title}")
+        out.append("")
+        out.append("| Instrument | Ticker | ISIN | Quantité | Valeur | PRU | Perf. |")
+        out.append("| --- | --- | --- | ---: | ---: | ---: | ---: |")
+        total_val = 0.0
+        for r in g["rows"]:
+            try:
+                total_val += float(r["value"])
+            except (TypeError, ValueError):
+                pass
+            name = r["name"] or r["symbol"] or r["isin"] or "?"
+            buying = _fmt_eur(r["buying"]) if r["buying"] is not None else "—"
+            perf = _fmt_pct(r["perf"]) if r["perf"] is not None else "—"
+            out.append(
+                f"| {name} | {r['symbol'] or '—'} | {r['isin'] or '—'} | "
+                f"{_fmt_qty(r['quantity'])} | {_fmt_eur(r['value'])} | {buying} | {perf} |"
+            )
+        out.append(
+            f"| **Total** | | | | **{_fmt_eur(total_val)}** | | "
+            f"_{len(g['rows'])} ligne(s)_ |"
+        )
+        out.append("")
+    return "\n".join(out).rstrip()
+
+
+@mcp.tool(
+    name="finary_get_account",
+    annotations={
+        "title": "Get all holdings of an account / broker",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def finary_get_account(params: AccountInput) -> str:
+    """Get every holding of one account or broker (a whole "portfolio").
+
+    Like finary_get_position but filtered by account instead of by instrument:
+    it fetches the holdings once, keeps only the lines held in the matching
+    account(s), and returns them with a per-account total — so dumping the IBKR
+    portfolio no longer means downloading everything. The query matches an
+    institution name (e.g. 'Interactive Brokers'), an account name (e.g. 'IBKR',
+    'PEA') or an account id; a broker with several accounts yields one section
+    per account.
+
+    Args:
+        params:
+            - query: institution name, account name, or account id.
+            - response_format: 'markdown' (default) or 'json'.
+
+    Returns:
+        Markdown holdings grouped per account, or the holdings as JSON.
+    """
+    try:
+        records = list(_iter_account_positions(_client.get_holdings_accounts()))
+        if not records:
+            records = list(_iter_flat_positions())
+        groups = _group_by_account(records, params.query)
+        if params.response_format == ResponseFormat.JSON:
+            payload = [
+                {
+                    "institution": g["institution"], "account": g["account"],
+                    "account_id": g["account_id"], "lines_count": len(g["rows"]),
+                    "total_value": sum(
+                        float(r["value"]) for r in g["rows"]
+                        if isinstance(r["value"], (int, float))
+                    ),
+                    "positions": [
+                        {
+                            "name": r["name"], "symbol": r["symbol"], "isin": r["isin"],
+                            "kind": r["kind"], "quantity": r["quantity"],
+                            "value": r["value"], "buying_price": r["buying"],
+                            "performance": r["perf"],
+                        }
+                        for r in g["rows"]
+                    ],
+                }
+                for g in groups
+            ]
+            return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+        return _render_accounts(groups, params.query)
+    except Exception as e:  # noqa: BLE001
+        return _handle_error(e)
+
+
+# ===========================================================================
 # AUTH MIDDLEWARE — copied verbatim from obsidian_mcp.py
 # Same dual-mode: /{token}/ URL path prefix OR Authorization: Bearer header.
 # ===========================================================================
