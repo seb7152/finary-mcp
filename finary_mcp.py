@@ -1200,6 +1200,160 @@ async def finary_get_position(params: PositionInput) -> str:
 
 
 # ===========================================================================
+# TOOLS — Account / portfolio lookup (all holdings of one account or broker)
+# ===========================================================================
+
+
+class AccountInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    query: str = Field(
+        description="Account name, account id, or institution name to fetch. "
+        "Examples: 'IBKR', 'Interactive Brokers', 'Trade Republic', 'PEA'.",
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+
+def _account_query_matches(query: str, meta: dict) -> bool:
+    q = query.strip().lower()
+    if not q:
+        return False
+    inst = (meta.get("institution") or "").lower()
+    acc = (meta.get("account") or "").lower()
+    acc_id = str(meta.get("account_id") or "").lower()
+    return q == acc_id or q in inst or q in acc
+
+
+def _group_by_account(records, query: str) -> list:
+    """Keep records whose account/institution matches the query and group them
+    per account (so 'IBKR' returns every line held in the IBKR account(s))."""
+    groups: dict = {}
+    order: list = []
+    for rec in records:
+        if not _account_query_matches(query, rec):
+            continue
+        key = str(rec.get("account_id") or "") or f"{rec['institution']}|{rec['account']}"
+        if key not in groups:
+            groups[key] = {
+                "institution": rec["institution"], "account": rec["account"],
+                "account_id": rec["account_id"], "rows": [],
+            }
+            order.append(key)
+        pos = rec["position"]
+        groups[key]["rows"].append({
+            "name": rec["name"], "symbol": rec["symbol"], "isin": rec["isin"],
+            "kind": rec["kind"],
+            "quantity": _pick(pos, "quantity", "shares", "units"),
+            "value": _amount(_pick(
+                pos, "display_current_value", "current_value", "display_value",
+                "value", "amount", "display_balance", "balance",
+            )),
+            "buying": _amount(_pick(pos, "display_buying_price", "buying_price")),
+            "perf": _amount(_pick(
+                pos, "display_unrealized_performance", "display_diff_gain",
+                "performance", "variation_percentage",
+            )),
+        })
+    return [groups[k] for k in order]
+
+
+def _render_accounts(groups: list, query: str) -> str:
+    if not groups:
+        return (
+            f"# Portefeuille « {query} »\n\n"
+            "_Aucun compte correspondant._ Essayez le nom de l'institution "
+            "(ex. 'Interactive Brokers') ou utilisez `finary_list_holdings_accounts` "
+            "pour voir les comptes disponibles."
+        )
+    out: list[str] = []
+    for g in groups:
+        title = " — ".join(x for x in (g["institution"], g["account"]) if x) or "?"
+        out.append(f"## {title}")
+        out.append("")
+        out.append("| Instrument | Ticker | ISIN | Quantité | Valeur | PRU | Perf. |")
+        out.append("| --- | --- | --- | ---: | ---: | ---: | ---: |")
+        total_val = 0.0
+        for r in g["rows"]:
+            try:
+                total_val += float(r["value"])
+            except (TypeError, ValueError):
+                pass
+            name = r["name"] or r["symbol"] or r["isin"] or "?"
+            buying = _fmt_eur(r["buying"]) if r["buying"] is not None else "—"
+            perf = _fmt_pct(r["perf"]) if r["perf"] is not None else "—"
+            out.append(
+                f"| {name} | {r['symbol'] or '—'} | {r['isin'] or '—'} | "
+                f"{_fmt_qty(r['quantity'])} | {_fmt_eur(r['value'])} | {buying} | {perf} |"
+            )
+        out.append(
+            f"| **Total** | | | | **{_fmt_eur(total_val)}** | | "
+            f"_{len(g['rows'])} ligne(s)_ |"
+        )
+        out.append("")
+    return "\n".join(out).rstrip()
+
+
+@mcp.tool(
+    name="finary_get_account",
+    annotations={
+        "title": "Get all holdings of an account / broker",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def finary_get_account(params: AccountInput) -> str:
+    """Get every holding of one account or broker (a whole "portfolio").
+
+    Like finary_get_position but filtered by account instead of by instrument:
+    it fetches the holdings once, keeps only the lines held in the matching
+    account(s), and returns them with a per-account total — so dumping the IBKR
+    portfolio no longer means downloading everything. The query matches an
+    institution name (e.g. 'Interactive Brokers'), an account name (e.g. 'IBKR',
+    'PEA') or an account id; a broker with several accounts yields one section
+    per account.
+
+    Args:
+        params:
+            - query: institution name, account name, or account id.
+            - response_format: 'markdown' (default) or 'json'.
+
+    Returns:
+        Markdown holdings grouped per account, or the holdings as JSON.
+    """
+    try:
+        records = list(_iter_account_positions(_client.get_holdings_accounts()))
+        if not records:
+            records = list(_iter_flat_positions())
+        groups = _group_by_account(records, params.query)
+        if params.response_format == ResponseFormat.JSON:
+            payload = [
+                {
+                    "institution": g["institution"], "account": g["account"],
+                    "account_id": g["account_id"], "lines_count": len(g["rows"]),
+                    "total_value": sum(
+                        float(r["value"]) for r in g["rows"]
+                        if isinstance(r["value"], (int, float))
+                    ),
+                    "positions": [
+                        {
+                            "name": r["name"], "symbol": r["symbol"], "isin": r["isin"],
+                            "kind": r["kind"], "quantity": r["quantity"],
+                            "value": r["value"], "buying_price": r["buying"],
+                            "performance": r["perf"],
+                        }
+                        for r in g["rows"]
+                    ],
+                }
+                for g in groups
+            ]
+            return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+        return _render_accounts(groups, params.query)
+    except Exception as e:  # noqa: BLE001
+        return _handle_error(e)
+
+
+# ===========================================================================
 # AUTH MIDDLEWARE — copied verbatim from obsidian_mcp.py
 # Same dual-mode: /{token}/ URL path prefix OR Authorization: Bearer header.
 # ===========================================================================
