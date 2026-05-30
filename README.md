@@ -53,6 +53,14 @@ Aggregate views:
   JSON gives the full `{date, value}` series. Params: `category`, `period`,
   `metric`, `response_format`. _(Finary only exposes history at the asset-class
   level — no per-account/per-position value history.)_
+- `finary_get_evolution_value` — market-price evolution / **backtest** of a single
+  listed holding via Yahoo Finance (yfinance). Resolves a Finary `query`
+  (ticker/ISIN/name → Yahoo ticker, using the position's current quantity) or
+  takes an explicit `ticker`; charts price × constant quantity over `period`
+  (1mo…max). Only for listed instruments (stocks, ETFs, listed funds, crypto) —
+  unlisted bonds / money-market / structured funds return a clear "not on Yahoo"
+  message instead of a wrong number. Constant-quantity (no past buys/sells), value
+  in the Yahoo quote currency (no FX conversion).
 - `finary_get_overview` — totals per asset class
 
 Position lookup:
