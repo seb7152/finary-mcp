@@ -46,6 +46,13 @@ Aggregate views:
 - `finary_get_gross_wealth` — current gross patrimoine + weekly variation
 - `finary_get_timeseries` — historical series (1w, 1m, ytd, 1y, all) for
   gross / net / finance metric
+- `finary_get_value_timeseries` — value evolution over a parameterizable horizon
+  for the **total** or a single **asset class** (investments, cryptos,
+  real_estates, fonds_euro, savings, checkings, commodities, loans). Markdown
+  gives a summary (start/end/delta/min/max) + a downsampled series (~12 points);
+  JSON gives the full `{date, value}` series. Params: `category`, `period`,
+  `metric`, `response_format`. _(Finary only exposes history at the asset-class
+  level — no per-account/per-position value history.)_
 - `finary_get_overview` — totals per asset class
 
 Position lookup:
