@@ -1181,6 +1181,14 @@ async def finary_get_position(params: PositionInput) -> str:
                 {
                     "name": g["name"], "symbol": g["symbol"], "isin": g["isin"],
                     "accounts_count": len(g["rows"]),
+                    "total_quantity": sum(
+                        float(r["quantity"]) for r in g["rows"]
+                        if isinstance(r["quantity"], (int, float))
+                    ),
+                    "total_value": sum(
+                        float(r["value"]) for r in g["rows"]
+                        if isinstance(r["value"], (int, float))
+                    ),
                     "positions": [
                         {
                             "institution": r["institution"], "account": r["account"],
