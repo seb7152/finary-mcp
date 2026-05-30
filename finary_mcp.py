@@ -366,19 +366,21 @@ def _render_account_like(items: list, title: str) -> str:
     lines = [f"# {title}\n"]
     total = 0.0
     for item in items:
-        name = _pick(item, "name", "display_name", "code", "description", "address") or "?"
-        value = _pick(
+        symbol, _isin, nested_name, _instrument = _position_identity(item)
+        name = nested_name or _pick(item, "name", "display_name", "code", "description", "address") or "?"
+        value = _amount(_pick(
             item,
             "display_current_value", "current_value",
             "display_balance", "balance", "amount", "user_estimated_value",
-        )
+        ))
         perf = _pick(item, "display_diff_gain", "performance", "variation_percentage")
         try:
             total += float(value)
         except (TypeError, ValueError):
             pass
+        ticker = f" (`{symbol}`)" if symbol else ""
         suffix = f" ({_fmt_pct(perf)})" if perf is not None else ""
-        lines.append(f"- **{name}** — {_fmt_eur(value)}{suffix}")
+        lines.append(f"- **{name}**{ticker} — {_fmt_eur(value)}{suffix}")
     if total:
         lines.append(f"\n**Total** : {_fmt_eur(total)}")
     return "\n".join(lines)
