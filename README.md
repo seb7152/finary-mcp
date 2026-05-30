@@ -48,6 +48,16 @@ Aggregate views:
   gross / net / finance metric
 - `finary_get_overview` — totals per asset class
 
+Position lookup:
+
+- `finary_get_position` — find one holding by **ticker / ISIN / name**, across
+  every account, without downloading the whole portfolio. Returns only the
+  matching position(s); an instrument held in several accounts (e.g. SPOT on
+  both IBKR and Trade Republic) is grouped with a per-account breakdown
+  (institution, account, quantity, value, average buying price, performance)
+  and aggregated totals. Params: `query` (required), `match_by`
+  (`auto` | `ticker` | `isin` | `name`), `response_format`.
+
 Per-asset-class lists:
 
 - `finary_list_investments` (PEA, CTO, PER…)
