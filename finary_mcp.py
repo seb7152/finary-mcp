@@ -951,6 +951,10 @@ class PositionInput(BaseModel):
 # Sub-objects that, when present on a position, carry the instrument identity.
 _INSTRUMENT_SUBKEYS = ("security", "crypto", "fonds_euro", "scpi", "precious_metal", "asset")
 
+# Per-account arrays that mirror the typed arrays (a unified view); walked only
+# as a fallback so positions are not double-counted.
+_GENERIC_POSITION_KEYS = ("holdings",)
+
 
 def _amount(value: Any) -> Any:
     """Finary sometimes wraps a monetary value in a dict ({eur, display, ...})."""
@@ -1000,27 +1004,37 @@ def _account_meta(acc: dict) -> dict:
 def _iter_account_positions(holdings_payload: Any):
     """Yield position records (with institution/account context) from holdings_accounts.
 
-    Walks every list-valued field of each account and keeps items that expose an
-    instrument identity (a nested security/crypto/... sub-object, or a direct
-    symbol/ISIN). This stays resilient to Finary renaming its per-class arrays.
+    Each account exposes its positions in typed arrays (`securities`, `cryptos`,
+    …) *and* mirrors them in a generic `holdings` array. We walk the typed arrays
+    first, then `holdings` only as a fallback, deduplicating per account by
+    instrument identity so a line held once is never counted twice.
     """
     for acc in _to_list(holdings_payload):
         if not isinstance(acc, dict):
             continue
         meta = _account_meta(acc)
+        typed: list = []
+        generic: list = []
         for key, val in acc.items():
             if not isinstance(val, list):
                 continue
+            bucket = generic if key in _GENERIC_POSITION_KEYS else typed
             for item in val:
-                if not isinstance(item, dict):
-                    continue
-                symbol, isin, name, instrument = _position_identity(item)
-                if instrument is None and not symbol and not isin:
-                    continue
-                yield {
-                    **meta, "kind": key, "position": item,
-                    "symbol": symbol, "isin": isin, "name": name,
-                }
+                if isinstance(item, dict):
+                    bucket.append((key, item))
+        seen: set = set()
+        for key, item in typed + generic:
+            symbol, isin, name, instrument = _position_identity(item)
+            if instrument is None and not symbol and not isin:
+                continue
+            dedup_key = (isin or "").lower() or (symbol or "").lower() or (name or "").lower()
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            yield {
+                **meta, "kind": key, "position": item,
+                "symbol": symbol, "isin": isin, "name": name,
+            }
 
 
 def _iter_flat_positions():
