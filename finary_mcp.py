@@ -1531,6 +1531,237 @@ async def finary_get_value_timeseries(params: ValueTimeseriesInput) -> str:
 
 
 # ===========================================================================
+# TOOLS — Market-price evolution / backtest via yfinance
+# ===========================================================================
+
+
+class EvolutionPeriod(str, Enum):
+    M1 = "1mo"
+    M3 = "3mo"
+    M6 = "6mo"
+    YTD = "ytd"
+    Y1 = "1y"
+    Y2 = "2y"
+    Y5 = "5y"
+    MAX = "max"
+
+
+class EvolutionValueInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    query: str = Field(
+        default="",
+        description="Finary position to chart (ticker/ISIN/name, e.g. 'WAVE'). Its "
+        "current quantity and identifiers are used to resolve a Yahoo ticker. "
+        "Ignored when `ticker` is provided.",
+    )
+    ticker: str = Field(
+        default="",
+        description="Explicit Yahoo Finance ticker (e.g. 'WAVE.PA', 'AAPL', 'BTC-USD'). "
+        "Skips Finary lookup and auto-resolution.",
+    )
+    quantity: float | None = Field(
+        default=None,
+        description="Quantity used to value the series. Defaults to the Finary "
+        "position's current quantity; with `ticker` and no quantity, a pure price "
+        "series (quantity = 1) is returned.",
+    )
+    period: EvolutionPeriod = Field(
+        default=EvolutionPeriod.Y1,
+        description="History horizon: 1mo, 3mo, 6mo, ytd, 1y (default), 2y, 5y, max.",
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+
+def _fmt_money(amount: Any, currency: str = "EUR") -> str:
+    try:
+        v = float(amount)
+    except (TypeError, ValueError):
+        return str(amount)
+    s = f"{v:,.2f}".replace(",", " ").replace(".", ",")
+    sym = {"EUR": "€", "USD": "$", "GBP": "£", "CHF": "CHF", "JPY": "¥"}.get(currency)
+    return f"{s} {sym}" if sym else f"{s} {currency}"
+
+
+def _yahoo_resolve(isin: str = "", symbol: str = "", name: str = "") -> tuple:
+    """Resolve a Yahoo ticker from an ISIN (most reliable), then name, then symbol.
+
+    Returns (ticker, matched_name) or (None, None). Only listed instrument types
+    are accepted, so unlisted bonds / money-market funds simply don't resolve.
+    """
+    import urllib.parse
+    import urllib.request
+
+    accepted = {"EQUITY", "ETF", "MUTUALFUND", "CRYPTOCURRENCY"}
+    for q in (isin, name, symbol):
+        if not q:
+            continue
+        url = (
+            "https://query1.finance.yahoo.com/v1/finance/search?q="
+            + urllib.parse.quote(str(q))
+            + "&quotesCount=5&newsCount=0"
+        )
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            data = json.load(urllib.request.urlopen(req, timeout=15))
+        except Exception:  # noqa: BLE001
+            continue
+        hits = [
+            x for x in data.get("quotes", [])
+            if x.get("quoteType") in accepted and x.get("symbol")
+        ]
+        if hits:
+            top = hits[0]
+            return top["symbol"], top.get("shortname") or top.get("longname")
+    return None, None
+
+
+def _fetch_price_history(ticker: str, period: str) -> tuple:
+    """Return (list[{date, price}], currency) from Yahoo Finance via yfinance."""
+    import yfinance as yf
+
+    t = yf.Ticker(ticker)
+    hist = t.history(period=period)
+    currency = "?"
+    try:
+        currency = t.fast_info.get("currency") or "?"
+    except Exception:  # noqa: BLE001
+        pass
+    series: list[dict] = []
+    if hist is not None and len(hist):
+        closes = hist["Close"].dropna()
+        for idx, val in closes.items():
+            series.append({"date": str(idx)[:10], "price": float(val)})
+    return series, currency
+
+
+def _render_evolution_value(series: list[dict], meta: dict) -> str:
+    cur = meta["currency"]
+    first, last = series[0], series[-1]
+    prices = [p["price"] for p in series]
+    lo, hi = min(prices), max(prices)
+    pct = (last["price"] / first["price"] - 1) * 100 if first["price"] else None
+    title = meta["label"] or meta["ticker"]
+    qty = meta["quantity"]
+    qty_note = " (quantité Finary actuelle)" if meta.get("from_finary") and meta.get("quantity_overridden") is False else ""
+    lines = [
+        f"# Évolution (cours) — {title} ({meta['ticker']}, {meta['period']})\n",
+        f"- **Ticker Yahoo** : `{meta['ticker']}`"
+        + (f" — {meta['matched_name']}" if meta.get("matched_name") else ""),
+        f"- **Quantité** : {_fmt_qty(qty)}{qty_note}",
+        f"- **Devise** : {cur}",
+        f"- **Du** : {first['date']} → **Au** : {last['date']}",
+        f"- **Cours** : {_fmt_money(first['price'], cur)} → {_fmt_money(last['price'], cur)} "
+        f"({_fmt_pct(pct) if pct is not None else 'n/a'})",
+        f"- **Valeur (cours × quantité)** : {_fmt_money(first['value'], cur)} → {_fmt_money(last['value'], cur)}",
+        f"- **Cours min / max** : {_fmt_money(lo, cur)} / {_fmt_money(hi, cur)}",
+        f"- **Points** : {len(series)}",
+        "",
+        "| Date | Cours | Valeur |",
+        "| --- | ---: | ---: |",
+    ]
+    for p in _downsample(series, 12):
+        lines.append(f"| {p['date']} | {_fmt_money(p['price'], cur)} | {_fmt_money(p['value'], cur)} |")
+    lines.append(
+        "\n_Backtest à quantité constante : n'intègre pas les achats/ventes passés. "
+        "Valeur exprimée dans la devise de cotation Yahoo (pas de conversion FX)._"
+    )
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="finary_get_evolution_value",
+    annotations={
+        "title": "Market-price evolution / backtest of a listed holding",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def finary_get_evolution_value(params: EvolutionValueInput) -> str:
+    """Chart the market-price evolution of a listed security over a horizon (yfinance).
+
+    Pulls the historical price from Yahoo Finance and multiplies it by a constant
+    quantity (the Finary position's current quantity by default) to get a value
+    "backtest". Give either a Finary `query` (ticker/ISIN/name — quantity and
+    identifiers are taken from the held position) or an explicit Yahoo `ticker`.
+
+    Only works for listed instruments (stocks, ETFs, listed funds, crypto). Bonds,
+    money-market/structured funds that aren't on Yahoo can't be resolved and return
+    a clear message instead of a wrong number. The resolved Yahoo ticker is always
+    shown so the mapping can be verified.
+
+    Args:
+        params:
+            - query: a Finary position (ticker/ISIN/name), or
+            - ticker: an explicit Yahoo ticker (overrides query).
+            - quantity: override the quantity (defaults to the Finary position's).
+            - period: 1mo | 3mo | 6mo | ytd | 1y (default) | 2y | 5y | max.
+            - response_format: 'markdown' (default) | 'json'.
+
+    Returns:
+        Markdown summary + a ~12-point sampled series, or the full series as JSON.
+    """
+    try:
+        ticker = params.ticker.strip()
+        qty = params.quantity
+        label = ticker or ""
+        matched_name = None
+        from_finary = False
+
+        if not ticker:
+            if not params.query.strip():
+                return "Error: provide either `ticker` (a Yahoo symbol) or `query` (a Finary position)."
+            records = list(_iter_account_positions(_client.get_holdings_accounts()))
+            if not records:
+                records = list(_iter_flat_positions())
+            groups = _group_matches(records, params.query, MatchBy.AUTO)
+            if not groups:
+                return f"Aucune position Finary ne correspond à « {params.query} »."
+            g = groups[0]
+            from_finary = True
+            finary_qty = sum(
+                float(r["quantity"]) for r in g["rows"]
+                if isinstance(r["quantity"], (int, float))
+            )
+            ticker, matched_name = _yahoo_resolve(g["isin"] or "", g["symbol"] or "", g["name"] or "")
+            if not ticker:
+                return (
+                    f"« {g['name'] or params.query} » (ISIN {g['isin'] or 'n/a'}, "
+                    f"symbole {g['symbol'] or 'n/a'}) n'a pas pu être associé à un ticker "
+                    "Yahoo Finance — probablement un instrument non coté (obligation, fonds "
+                    "monétaire/structuré). Fournissez un `ticker` explicite si vous le connaissez."
+                )
+            label = g["name"] or matched_name or ticker
+            if qty is None:
+                qty = finary_qty
+
+        quantity_overridden = params.quantity is not None
+        if qty is None:
+            qty = 1.0
+
+        series, currency = _fetch_price_history(ticker, params.period.value)
+        if not series:
+            return f"Aucun historique de cours renvoyé par Yahoo Finance pour « {ticker} »."
+        for p in series:
+            p["value"] = p["price"] * qty
+
+        meta = {
+            "label": label, "ticker": ticker, "matched_name": matched_name,
+            "currency": currency, "quantity": qty, "period": params.period.value,
+            "from_finary": from_finary, "quantity_overridden": quantity_overridden,
+        }
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps(
+                {**meta, "points": len(series), "series": series},
+                indent=2, ensure_ascii=False, default=str,
+            )
+        return _render_evolution_value(series, meta)
+    except Exception as e:  # noqa: BLE001
+        return _handle_error(e)
+
+
+# ===========================================================================
 # AUTH MIDDLEWARE — copied verbatim from obsidian_mcp.py
 # Same dual-mode: /{token}/ URL path prefix OR Authorization: Bearer header.
 # ===========================================================================
