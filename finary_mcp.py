@@ -1383,6 +1383,154 @@ async def finary_get_account(params: AccountInput) -> str:
 
 
 # ===========================================================================
+# TOOLS — Value timeseries (evolution of the total or one asset class)
+# ===========================================================================
+
+
+class TimeseriesCategory(str, Enum):
+    TOTAL = "total"
+    INVESTMENTS = "investments"
+    CRYPTOS = "cryptos"
+    REAL_ESTATES = "real_estates"
+    FONDS_EURO = "fonds_euro"
+    SAVINGS = "savings"
+    CHECKINGS = "checkings"
+    COMMODITIES = "commodities"
+    LOANS = "loans"
+
+
+class ValueTimeseriesInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    category: TimeseriesCategory = Field(
+        default=TimeseriesCategory.TOTAL,
+        description=(
+            "Which slice of wealth to chart: 'total' (whole patrimoine) or a single "
+            "asset class — investments (stocks/ETF/PEA/CTO/PER), cryptos, real_estates, "
+            "fonds_euro, savings, checkings, commodities (métaux précieux), loans."
+        ),
+    )
+    period: TimeseriesPeriod = Field(
+        default=TimeseriesPeriod.YEAR,
+        description="Horizon: 1w, 1m, ytd, 1y, or all.",
+    )
+    metric: TimeseriesMetric = Field(
+        default=TimeseriesMetric.GROSS,
+        description="Valuation metric for the series: gross, net, or finance (financial assets only).",
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+
+def _normalize_category_timeseries(payload: Any, category: str) -> list[dict]:
+    """Like _normalize_timeseries but extracts one breakdown sub-key per point.
+
+    Finary returns `[[iso_date, breakdown], ...]` where `breakdown` holds one
+    `{amount}` sub-dict per asset class plus a `total`.
+    """
+    points: list[dict] = []
+    for entry in _to_list(payload):
+        if isinstance(entry, (list, tuple)) and len(entry) == 2:
+            date, breakdown = entry
+            if isinstance(breakdown, dict):
+                node = breakdown.get(category)
+                value = node.get("amount") if isinstance(node, dict) else None
+                points.append({"date": date, "value": value})
+    return points
+
+
+def _downsample(series: list, n: int = 12) -> list:
+    """Pick ~n evenly spaced points (keeping first and last) to keep output light."""
+    if len(series) <= n:
+        return series
+    step = (len(series) - 1) / (n - 1)
+    return [series[round(i * step)] for i in range(n)]
+
+
+def _render_value_timeseries(series: list[dict], category: str, metric: str, period: str) -> str:
+    clean = [p for p in series if isinstance(p["value"], (int, float))]
+    if not clean:
+        return (
+            f"# Évolution — {category} ({metric}, {period})\n\n"
+            "_Aucune donnée sur cette période/catégorie._"
+        )
+    first, last = clean[0], clean[-1]
+    values = [p["value"] for p in clean]
+    lo, hi = min(values), max(values)
+    delta = last["value"] - first["value"]
+    pct = (delta / first["value"] * 100) if first["value"] else None
+    lines = [
+        f"# Évolution — {category} ({metric}, {period})\n",
+        f"- **Du** : {str(first['date'])[:10]} → **Au** : {str(last['date'])[:10]}",
+        f"- **Valeur initiale** : {_fmt_eur(first['value'])}",
+        f"- **Valeur finale** : {_fmt_eur(last['value'])}",
+        f"- **Évolution** : {_fmt_eur(delta)} ({_fmt_pct(pct) if pct is not None else 'n/a'})",
+        f"- **Min / Max** : {_fmt_eur(lo)} / {_fmt_eur(hi)}",
+        f"- **Points** : {len(clean)}",
+        "",
+        "| Date | Valeur |",
+        "| --- | ---: |",
+    ]
+    for p in _downsample(clean, 12):
+        lines.append(f"| {str(p['date'])[:10]} | {_fmt_eur(p['value'])} |")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="finary_get_value_timeseries",
+    annotations={
+        "title": "Get value evolution of total or an asset class",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def finary_get_value_timeseries(params: ValueTimeseriesInput) -> str:
+    """Get the value evolution over a horizon for the whole patrimoine or one asset class.
+
+    Charts how a slice of wealth (total, investments, cryptos, real estate, fonds
+    euro, savings, checkings, commodities, loans) has moved over the chosen period.
+    Markdown returns a compact summary (start/end/delta/min/max) plus a downsampled
+    series (~12 points) so it stays cheap in tokens; JSON returns the full series.
+
+    Note: Finary only exposes history at the asset-class level — per-account or
+    per-position value history is not available through this endpoint.
+
+    Args:
+        params:
+            - category: 'total' (default) or an asset class.
+            - period: '1w' | '1m' | 'ytd' | '1y' (default) | 'all'.
+            - metric: 'gross' (default) | 'net' | 'finance'.
+            - response_format: 'markdown' (default) | 'json'.
+
+    Returns:
+        Markdown summary + sampled series, or the full {date, value} series as JSON.
+    """
+    try:
+        data = _client.get_timeseries(params.period.value, params.metric.value)
+        series = _normalize_category_timeseries(data, params.category.value)
+        if params.response_format == ResponseFormat.JSON:
+            clean = [
+                {"date": str(p["date"])[:10], "value": p["value"]}
+                for p in series if isinstance(p["value"], (int, float))
+            ]
+            return json.dumps(
+                {
+                    "category": params.category.value,
+                    "metric": params.metric.value,
+                    "period": params.period.value,
+                    "points": len(clean),
+                    "series": clean,
+                },
+                indent=2, ensure_ascii=False, default=str,
+            )
+        return _render_value_timeseries(
+            series, params.category.value, params.metric.value, params.period.value
+        )
+    except Exception as e:  # noqa: BLE001
+        return _handle_error(e)
+
+
+# ===========================================================================
 # AUTH MIDDLEWARE — copied verbatim from obsidian_mcp.py
 # Same dual-mode: /{token}/ URL path prefix OR Authorization: Bearer header.
 # ===========================================================================
