@@ -1836,6 +1836,7 @@ class TokenAuthMiddleware:
 
 if __name__ == "__main__":
     import uvicorn
+    from starlette.middleware.cors import CORSMiddleware
 
     print(f"Starting Finary MCP Server on port {PORT}")
     print(f"Session data directory: {FINARY_SESSION_DIR}")
@@ -1844,5 +1845,28 @@ if __name__ == "__main__":
 
     mcp_app = mcp.streamable_http_app()
     app = TokenAuthMiddleware(mcp_app)
+
+    # CORS must wrap the auth middleware (outermost layer). Browser preflight
+    # OPTIONS requests carry no Authorization header, so if auth ran first it
+    # would reject the preflight with 401 before any CORS headers were sent and
+    # the browser would block the call. With CORSMiddleware outermost, it answers
+    # preflights itself (200 + Access-Control-* headers) and decorates the
+    # responses of real requests. This is what lets a claude.ai artifact call the
+    # MCP directly from the browser. Authorization is allowed so the Bearer-auth
+    # flow survives the preflight, and Mcp-Session-Id is exposed so the browser
+    # can read the streamable-HTTP session id back off the response.
+    app = CORSMiddleware(
+        app,
+        allow_origins=["*"],
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=[
+            "Content-Type",
+            "Accept",
+            "Authorization",
+            "Mcp-Session-Id",
+            "Last-Event-ID",
+        ],
+        expose_headers=["Mcp-Session-Id"],
+    )
 
     uvicorn.run(app, host="0.0.0.0", port=PORT)
