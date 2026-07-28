@@ -32,9 +32,11 @@ side, just an MCP shim.
   inside the Docker network only.
 - The **existing Traefik** (from the obsidian-headless-mcp stack) discovers
   this container via the Docker socket and routes `finary-mcp.${DOMAIN}` to it.
-- A **single `API_TOKEN`** protects access — accepted either as a URL path
-  prefix `/{token}/mcp` or an `Authorization: Bearer <token>` header. Same
-  dual-mode auth as `obsidian-mcp`.
+- Access is protected either by a **legacy `API_TOKEN`** (accepted as a URL
+  path prefix `/{token}/mcp` or an `Authorization: Bearer <token>` header) or
+  by **OAuth 2.1 via Zitadel** (`Authorization: Bearer <access_token>`,
+  validated against the Zitadel userinfo endpoint and gated on the
+  `OAUTH_REQUIRED_ROLE` role). Same dual-mode auth as `obsidian-mcp`.
 - A named Docker volume (`finary-session`) persists `credentials.json` and
   `cookies.json` across restarts.
 
@@ -120,6 +122,8 @@ mkdir -p /docker/finary-mcp && cd /docker/finary-mcp
 git clone https://github.com/seb7152/finary-mcp.git .
 cp .env.example .env
 # Edit .env: DOMAIN, FINARY_EMAIL, FINARY_PASSWORD, API_TOKEN
+# Optional (OAuth 2.1 via Zitadel instead of/alongside API_TOKEN):
+#   ZITADEL_ISSUER, OAUTH_REQUIRED_ROLE
 ```
 
 Generate a strong API token:
@@ -208,8 +212,9 @@ npx @modelcontextprotocol/inspector python finary_mcp.py
 
 ## Security notes
 
-- `API_TOKEN` is the only thing between the open internet and your full
-  patrimoine — make it long, rotate it if leaked.
+- `API_TOKEN` (or, when unset, OAuth via Zitadel) is the only thing between
+  the open internet and your full patrimoine — make the token long and
+  rotate it if leaked, or rely on OAuth by leaving `API_TOKEN` empty.
 - Read-only by design: no add/update/delete tools are exposed even though
   `finary_uapi` supports them. If you want write operations later, add them
   deliberately and reconsider auth.

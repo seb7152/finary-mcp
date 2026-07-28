@@ -5,10 +5,12 @@ Read-only MCP server exposing a Finary account as a set of tools, via the
 unofficial `finary_uapi` wrapper. Designed to be deployed alongside the
 obsidian-headless-mcp stack on Hostinger, behind Traefik.
 
-Auth model identical to obsidian_mcp.py: a single `API_TOKEN` env var, accepted
+Auth model identical to obsidian_mcp.py: legacy `API_TOKEN` env var (accepted
 either as a `/{token}/` URL path prefix or as an `Authorization: Bearer <token>`
-header. DNS rebinding protection is disabled because the auth middleware
-forces the Host header to localhost before passing the request to FastMCP.
+header) OR OAuth 2.1 via Zitadel (bearer token validated against the userinfo
+endpoint, gated on a required role). DNS rebinding protection is disabled
+because the auth middleware forces the Host header to localhost before
+passing the request to FastMCP.
 """
 
 import json
@@ -18,6 +20,7 @@ import threading
 from enum import Enum
 from typing import Any, Callable
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, ConfigDict, Field
@@ -30,6 +33,11 @@ PORT = int(os.getenv("PORT", 3002))
 API_TOKEN = os.getenv("API_TOKEN", "")
 FINARY_SESSION_DIR = os.getenv("FINARY_SESSION_DIR", "/data")
 
+# OAuth 2.1 resource-server configuration (Zitadel) — see AuthMiddleware below
+ZITADEL_ISSUER = os.getenv("ZITADEL_ISSUER", "https://zitadel-k9z6.srv828065.hstgr.cloud")
+OAUTH_REQUIRED_ROLE = os.getenv("OAUTH_REQUIRED_ROLE", "finary-access")
+MCP_PUBLIC_URL = os.getenv("MCP_PUBLIC_URL", "")
+
 logging.basicConfig(
     level=os.environ.get("FINARY_MCP_LOG_LEVEL", "INFO"),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -39,7 +47,7 @@ log = logging.getLogger("finary_mcp")
 # ---------------------------------------------------------------------------
 # Create MCP server
 # ---------------------------------------------------------------------------
-# DNS rebinding protection disabled — TokenAuthMiddleware enforces auth and
+# DNS rebinding protection disabled — AuthMiddleware enforces auth and
 # rewrites the Host header to localhost before passing to FastMCP. Same trick
 # as obsidian_mcp.py.
 
@@ -1769,64 +1777,150 @@ async def finary_get_evolution_value(params: EvolutionValueInput) -> str:
 
 # ===========================================================================
 # AUTH MIDDLEWARE — copied verbatim from obsidian_mcp.py
-# Same dual-mode: /{token}/ URL path prefix OR Authorization: Bearer header.
+# Dual-mode: legacy API_TOKEN (path prefix or exact bearer match) OR
+# OAuth 2.1 (Zitadel) bearer token validated via userinfo + role check.
 # ===========================================================================
 
+ROLES_CLAIM = "urn:zitadel:iam:org:project:roles"
 
-class TokenAuthMiddleware:
-    """Authenticate requests via either a URL path prefix /{token}/... or
-    an `Authorization: Bearer <token>` header. Both schemes are accepted so
-    clients that can't customize the request URL (path-only) and clients that
-    prefer header-based auth (Bearer) both work."""
+_USERINFO_CACHE_TTL = 45
+_userinfo_cache: dict[str, tuple[float, dict | None]] = {}
 
+
+async def _fetch_userinfo(token: str) -> dict | None:
+    import hashlib
+    import time
+
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    now = time.monotonic()
+    cached = _userinfo_cache.get(token_hash)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    userinfo = None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"{ZITADEL_ISSUER}/oidc/v1/userinfo",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        if response.status_code == 200:
+            userinfo = response.json()
+    except httpx.HTTPError:
+        userinfo = None
+
+    _userinfo_cache[token_hash] = (now + _USERINFO_CACHE_TTL, userinfo)
+    return userinfo
+
+
+def _protected_resource_metadata_url() -> str:
+    return f"{MCP_PUBLIC_URL.rstrip('/')}/.well-known/oauth-protected-resource"
+
+
+class AuthMiddleware:
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] in ("http", "websocket"):
-            path = scope.get("path", "")
-            headers = scope.get("headers", [])
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
 
-            # Look for Authorization: Bearer <token>
-            auth_header = next(
-                (v for k, v in headers if k.lower() == b"authorization"),
-                None,
-            )
-            header_token = None
-            if auth_header:
-                try:
-                    decoded = auth_header.decode("latin-1").strip()
-                except Exception:
-                    decoded = ""
-                if decoded.lower().startswith("bearer "):
-                    header_token = decoded[7:].strip()
+        path = scope.get("path", "")
+        if path == "/.well-known/oauth-protected-resource":
+            await self._send_metadata(send)
+            return
 
-            path_has_token = bool(API_TOKEN) and path.startswith(f"/{API_TOKEN}")
-            header_ok = bool(API_TOKEN) and header_token == API_TOKEN
+        headers = scope.get("headers", [])
+        auth_header = next(
+            (v for k, v in headers if k.lower() == b"authorization"),
+            None,
+        )
+        bearer_token = None
+        if auth_header:
+            try:
+                decoded = auth_header.decode("latin-1").strip()
+            except Exception:
+                decoded = ""
+            if decoded.lower().startswith("bearer "):
+                bearer_token = decoded[7:].strip()
 
-            if API_TOKEN and not path_has_token and not header_ok:
-                async def send_401(send):
-                    await send({
-                        "type": "http.response.start",
-                        "status": 401,
-                        "headers": [(b"www-authenticate", b'Bearer realm="mcp"')],
-                    })
-                    await send({"type": "http.response.body", "body": b"Unauthorized"})
-                await send_401(send)
-                return
-
+        # -- 1. Legacy static token (path prefix or exact bearer match) --
+        path_has_static_token = bool(API_TOKEN) and path.startswith(f"/{API_TOKEN}")
+        header_matches_static = bool(API_TOKEN) and bearer_token == API_TOKEN
+        if path_has_static_token or header_matches_static:
             scope = dict(scope)
-            # Strip the token prefix from path only if it's actually there
-            if API_TOKEN and path_has_token:
+            if path_has_static_token:
                 new_path = path[len(f"/{API_TOKEN}"):] or "/"
                 scope["path"] = new_path
                 raw_path = scope.get("raw_path", path.encode())
                 scope["raw_path"] = raw_path[len(f"/{API_TOKEN}".encode()):] or b"/"
-            # Replace Host header with localhost to bypass FastMCP DNS rebinding protection
             new_headers = [(k, v) for k, v in headers if k.lower() != b"host"]
             new_headers.append((b"host", b"localhost"))
             scope["headers"] = new_headers
+            await self.app(scope, receive, send)
+            return
+
+        # -- 2. OAuth 2.1 (Zitadel) --
+        if not bearer_token:
+            await self._send_401(send, "invalid_request", "Missing bearer token")
+            return
+
+        userinfo = await _fetch_userinfo(bearer_token)
+        if userinfo is None:
+            await self._send_401(send, "invalid_token", "Token is invalid or expired")
+            return
+
+        roles = userinfo.get(ROLES_CLAIM) or {}
+        if OAUTH_REQUIRED_ROLE not in roles:
+            await self._send_403(send)
+            return
+
+        scope = dict(scope)
+        new_headers = [(k, v) for k, v in headers if k.lower() != b"host"]
+        new_headers.append((b"host", b"localhost"))
+        scope["headers"] = new_headers
         await self.app(scope, receive, send)
+
+    async def _send_metadata(self, send):
+        import json
+
+        body = json.dumps({
+            "resource": MCP_PUBLIC_URL,
+            "authorization_servers": [ZITADEL_ISSUER],
+        }).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"application/json")],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+    async def _send_401(self, send, error, description):
+        www_auth = (
+            f'Bearer error="{error}", error_description="{description}", '
+            f'resource_metadata="{_protected_resource_metadata_url()}"'
+        )
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [(b"www-authenticate", www_auth.encode())],
+        })
+        await send({"type": "http.response.body", "body": description.encode()})
+
+    async def _send_403(self, send):
+        import json
+
+        body = json.dumps({
+            "error": "forbidden",
+            "error_description": f"Missing required role: {OAUTH_REQUIRED_ROLE}",
+        }).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 403,
+            "headers": [(b"content-type", b"application/json")],
+        })
+        await send({"type": "http.response.body", "body": body})
 
 
 # ---------------------------------------------------------------------------
@@ -1841,10 +1935,10 @@ if __name__ == "__main__":
     print(f"Starting Finary MCP Server on port {PORT}")
     print(f"Session data directory: {FINARY_SESSION_DIR}")
     if not API_TOKEN:
-        print("⚠️  WARNING: API_TOKEN is empty — server is unauthenticated!")
+        print("ℹ️  API_TOKEN is empty — falling back to OAuth 2.1 (Zitadel) only.")
 
     mcp_app = mcp.streamable_http_app()
-    app = TokenAuthMiddleware(mcp_app)
+    app = AuthMiddleware(mcp_app)
 
     # CORS must wrap the auth middleware (outermost layer). Browser preflight
     # OPTIONS requests carry no Authorization header, so if auth ran first it
