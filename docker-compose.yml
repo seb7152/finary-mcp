@@ -28,7 +28,7 @@ services:
       - FINARY_SESSION_DIR=/data
       - MCP_PUBLIC_URL=https://finary-mcp.${DOMAIN}
       - ZITADEL_ISSUER=${ZITADEL_ISSUER:-https://zitadel-k9z6.srv828065.hstgr.cloud}
-      - OAUTH_REQUIRED_ROLE=${OAUTH_REQUIRED_ROLE:-finary-access}
+      - OAUTH_REQUIRED_ROLE=${OAUTH_REQUIRED_ROLE:-finary:access}
     # Bootstrap: pip install deps, fetch the latest finary_mcp.py from
     # GitHub, exec it. `docker compose restart` = update to whatever's on main.
     # `mcp<2` is pinned: the MCP Python SDK's v2.0.0 removed
