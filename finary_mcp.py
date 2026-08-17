@@ -35,7 +35,7 @@ FINARY_SESSION_DIR = os.getenv("FINARY_SESSION_DIR", "/data")
 
 # OAuth 2.1 resource-server configuration (Zitadel) — see AuthMiddleware below
 ZITADEL_ISSUER = os.getenv("ZITADEL_ISSUER", "https://zitadel-k9z6.srv828065.hstgr.cloud")
-OAUTH_REQUIRED_ROLE = os.getenv("OAUTH_REQUIRED_ROLE", "finary-access")
+OAUTH_REQUIRED_ROLE = os.getenv("OAUTH_REQUIRED_ROLE", "finary:access")
 MCP_PUBLIC_URL = os.getenv("MCP_PUBLIC_URL", "")
 
 logging.basicConfig(
