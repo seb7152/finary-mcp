@@ -37,6 +37,9 @@ side, just an MCP shim.
   by **OAuth 2.1 via Zitadel** (`Authorization: Bearer <access_token>`,
   validated against the Zitadel userinfo endpoint and gated on the
   `OAUTH_REQUIRED_ROLE` role). Same dual-mode auth as `obsidian-mcp`.
+- A **REST façade** (`/api/tools/...`) exposes the same tools as plain
+  HTTP/JSON for agents without an MCP client, behind the same auth. See
+  [REST API](#rest-api-for-agents-without-mcp).
 - A named Docker volume (`finary-session`) persists `credentials.json` and
   `cookies.json` across restarts.
 
@@ -161,7 +164,7 @@ curl -s https://finary-mcp.${DOMAIN}/mcp \
      -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-You should see the 16 tools listed.
+You should see the 22 tools listed.
 
 ### 5. Add to Claude
 
@@ -172,6 +175,129 @@ In claude.ai → Connectors → Add custom connector:
   - `https://finary-mcp.${DOMAIN}/mcp` (with HTTP header `Authorization: Bearer ${API_TOKEN}`)
 
 Same pattern as the obsidian-mcp connector.
+
+## REST API (for agents without MCP)
+
+The same tools are also exposed as a plain HTTP/JSON API, for agents or
+scripts that cannot speak MCP. It runs in the same container, behind the
+same auth, and calls exactly the same code as the MCP tools. Read-only
+except `finary_signin`, which only refreshes the Finary session.
+
+### Base URL and auth
+
+```
+https://finary-mcp.${DOMAIN}/api
+```
+
+Authenticate with **one** of:
+
+- header `Authorization: Bearer ${API_TOKEN}` (recommended), or
+- the token as a path prefix: `https://finary-mcp.${DOMAIN}/${API_TOKEN}/api/...`
+  (for clients that cannot set headers), or
+- a Zitadel OAuth access token carrying the `finary:access` role, as a Bearer header.
+
+Missing or wrong token → `401`.
+
+### Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/tools` | Catalog: every tool with its description and JSON Schema of parameters |
+| `POST` | `/api/tools/{name}` | Call a tool. Body = JSON object of parameters (`{}` or empty body for defaults) |
+| `GET` | `/api/tools/{name}?param=value` | Same call, parameters as query string |
+
+`response_format` defaults to **`json`** on the REST API (the MCP default is
+`markdown`). Pass `"response_format": "markdown"` to get a human-readable
+summary instead.
+
+### Response format
+
+Success (`200`):
+
+```json
+{ "ok": true, "tool": "finary_get_net_worth", "format": "json", "result": { "...": "raw Finary payload" } }
+```
+
+`format` is `"json"` when `result` is structured data, `"text"` when it is a
+string (markdown summaries, or plain messages such as "not listed on Yahoo Finance").
+
+Errors:
+
+```json
+{ "ok": false, "error": "invalid_params", "message": "Invalid parameters.", "details": [{ "field": "query", "message": "Field required" }] }
+```
+
+| Status | `error` | Meaning / what to do |
+|---|---|---|
+| `400` | `invalid_json` | Body is not a JSON object |
+| `400` | `invalid_params` | Unknown, missing or out-of-range parameter; see `details` |
+| `401` | — | Missing or invalid API token |
+| `404` | `unknown_tool` | No tool with that name; see `GET /api/tools` |
+| `502` | `tool_error` | The tool or Finary failed; read `message` |
+| `503` | `session_expired` | Finary session expired: call `finary_signin` (see below), then retry |
+
+### Tools
+
+| Tool | Parameters (default) |
+|---|---|
+| `finary_get_net_worth` | — current net wealth + weekly variation |
+| `finary_get_gross_wealth` | — current gross wealth + weekly variation |
+| `finary_get_overview` | — totals per asset class |
+| `finary_get_timeseries` | `period`: `1w`\|`1m`\|`ytd`\|`1y`\|`all` (`1m`), `metric`: `gross`\|`net`\|`finance` (`gross`) |
+| `finary_get_value_timeseries` | `category`: `total`\|`investments`\|`cryptos`\|`real_estates`\|`fonds_euro`\|`savings`\|`checkings`\|`commodities`\|`loans` (`total`), `period`: `1w`\|`1m`\|`ytd`\|`1y`\|`all` (`1y`), `metric`: `gross`\|`net`\|`finance` (`gross`) |
+| `finary_get_position` | `query` **required** (ticker, ISIN or name), `match_by`: `auto`\|`ticker`\|`isin`\|`name` (`auto`) |
+| `finary_get_account` | `query` **required** (account name, account id or institution name) |
+| `finary_get_evolution_value` | `query` (Finary position) **or** `ticker` (Yahoo symbol), `quantity` (current Finary quantity), `period`: `1mo`\|`3mo`\|`6mo`\|`ytd`\|`1y`\|`2y`\|`5y`\|`max` (`1y`) |
+| `finary_get_transactions` | `page` (`1`, `-1` = all pages), `perpage` (`50`), `account_ids`, `institution_ids` (comma-separated), `query` (label search) |
+| `finary_get_upcoming_dividends` | — |
+| `finary_get_user_info` | — (also a good healthcheck) |
+| `finary_list_investments` | — stocks, ETF, PEA, CTO, PER |
+| `finary_list_cryptos` | — |
+| `finary_list_scpis` | — |
+| `finary_list_real_estate` | — |
+| `finary_list_fonds_euro` | — |
+| `finary_list_crowdlendings` | — |
+| `finary_list_precious_metals` | — |
+| `finary_list_generic_assets` | — |
+| `finary_list_startups` | — |
+| `finary_list_holdings_accounts` | — banks and brokers |
+| `finary_signin` | `otp_code` (empty) — refreshes the Finary session |
+
+Every tool also accepts `response_format`: `json` (REST default) or `markdown`.
+Unknown parameters are rejected with `400`. `GET /api/tools` returns the
+authoritative list with full JSON Schemas.
+
+### Examples
+
+```bash
+BASE=https://finary-mcp.${DOMAIN}/api
+AUTH="Authorization: Bearer ${API_TOKEN}"
+
+# Catalog
+curl -s "$BASE/tools" -H "$AUTH"
+
+# Net worth (raw JSON)
+curl -s -X POST "$BASE/tools/finary_get_net_worth" -H "$AUTH"
+
+# One position across all accounts
+curl -s -X POST "$BASE/tools/finary_get_position" -H "$AUTH" \
+     -H 'Content-Type: application/json' -d '{"query": "SPOT"}'
+
+# Investments value over one year, as a markdown summary
+curl -s -X POST "$BASE/tools/finary_get_value_timeseries" -H "$AUTH" \
+     -H 'Content-Type: application/json' \
+     -d '{"category": "investments", "period": "1y", "response_format": "markdown"}'
+
+# GET form, token in the path (no headers)
+curl -s "https://finary-mcp.${DOMAIN}/${API_TOKEN}/api/tools/finary_get_account?query=PEA"
+```
+
+### When the Finary session expires (`503 session_expired`)
+
+1. `POST /api/tools/finary_signin` with body `{}`.
+2. If the result says MFA is required, ask the user for their 6-digit
+   authenticator code and call again with `{"otp_code": "123456"}`.
+3. Retry the original call.
 
 ## Updating
 
