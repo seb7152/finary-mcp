@@ -1776,6 +1776,112 @@ async def finary_get_evolution_value(params: EvolutionValueInput) -> str:
 
 
 # ===========================================================================
+# REST FAÇADE — plain HTTP/JSON access to the same tools, for agents without
+# an MCP client. Routes are registered on the FastMCP app (custom_route), so
+# they sit behind the same AuthMiddleware and CORS layers as /mcp.
+#
+#   GET  /api/tools          → catalog (name, title, description, input schema)
+#   POST /api/tools/{name}   → call a tool, JSON body = its parameters
+#   GET  /api/tools/{name}   → same, parameters as query-string
+#
+# Unlike MCP, response_format defaults to 'json' here. The tool registry is
+# read from FastMCP's tool manager (private attr, stable within the pinned
+# mcp<2 range).
+# ===========================================================================
+
+import typing
+
+from pydantic import ValidationError
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+
+def _rest_tools() -> dict:
+    return {t.name: t for t in mcp._tool_manager.list_tools()}
+
+
+def _rest_input_model(tool) -> type[BaseModel] | None:
+    model = typing.get_type_hints(tool.fn).get("params")
+    if isinstance(model, type) and issubclass(model, BaseModel):
+        return model
+    return None
+
+
+def _rest_error(status: int, error: str, message: str, **extra) -> JSONResponse:
+    return JSONResponse({"ok": False, "error": error, "message": message, **extra}, status_code=status)
+
+
+@mcp.custom_route("/api/tools", methods=["GET"])
+async def rest_list_tools(request: Request) -> JSONResponse:
+    tools = []
+    for name, tool in sorted(_rest_tools().items()):
+        model = _rest_input_model(tool)
+        annotations = tool.annotations
+        tools.append({
+            "name": name,
+            "title": getattr(annotations, "title", None) or tool.title or name,
+            "description": (tool.description or "").strip(),
+            "read_only": bool(getattr(annotations, "readOnlyHint", False)),
+            "endpoint": f"/api/tools/{name}",
+            "input_schema": model.model_json_schema() if model else {"type": "object", "properties": {}},
+        })
+    return JSONResponse({"ok": True, "tools": tools})
+
+
+@mcp.custom_route("/api/tools/{name}", methods=["GET", "POST"])
+async def rest_call_tool(request: Request) -> JSONResponse:
+    name = request.path_params["name"]
+    tool = _rest_tools().get(name)
+    if tool is None:
+        return _rest_error(404, "unknown_tool", f"No tool named '{name}'. GET /api/tools lists them.")
+
+    if request.method == "POST":
+        raw = await request.body()
+        try:
+            args = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError as e:
+            return _rest_error(400, "invalid_json", f"Request body is not valid JSON: {e}")
+        if not isinstance(args, dict):
+            return _rest_error(400, "invalid_json", "Request body must be a JSON object.")
+    else:
+        args = dict(request.query_params)
+
+    model = _rest_input_model(tool)
+    if model is None:
+        return _rest_error(500, "unsupported_tool", f"Tool '{name}' has no parameter model.")
+    if "response_format" in model.model_fields and "response_format" not in args:
+        args["response_format"] = ResponseFormat.JSON.value
+
+    try:
+        params = model.model_validate(args)
+    except ValidationError as e:
+        details = [
+            {"field": ".".join(str(x) for x in err["loc"]), "message": err["msg"]}
+            for err in e.errors()
+        ]
+        return _rest_error(400, "invalid_params", "Invalid parameters.", details=details)
+
+    try:
+        output = await tool.fn(params)
+    except Exception as e:  # noqa: BLE001 — tools normally catch their own errors
+        return _rest_error(500, "tool_failed", _handle_error(e))
+
+    text = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False, default=str)
+    if text.startswith("Error:"):
+        if "finary_signin" in text:
+            return _rest_error(503, "session_expired", text)
+        return _rest_error(502, "tool_error", text)
+
+    fmt = getattr(params, "response_format", None)
+    if fmt == ResponseFormat.JSON:
+        try:
+            return JSONResponse({"ok": True, "tool": name, "format": "json", "result": json.loads(text)})
+        except json.JSONDecodeError:
+            pass  # tool answered with a plain message (e.g. "no match") — return it as text
+    return JSONResponse({"ok": True, "tool": name, "format": "text", "result": text})
+
+
+# ===========================================================================
 # AUTH MIDDLEWARE — copied verbatim from obsidian_mcp.py
 # Dual-mode: legacy API_TOKEN (path prefix or exact bearer match) OR
 # OAuth 2.1 (Zitadel) bearer token validated via userinfo + role check.
