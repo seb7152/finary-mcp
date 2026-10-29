@@ -36,6 +36,9 @@ FINARY_SESSION_DIR = os.getenv("FINARY_SESSION_DIR", "/data")
 # OAuth 2.1 resource-server configuration (Zitadel) — see AuthMiddleware below
 ZITADEL_ISSUER = os.getenv("ZITADEL_ISSUER", "https://zitadel-k9z6.srv828065.hstgr.cloud")
 OAUTH_REQUIRED_ROLE = os.getenv("OAUTH_REQUIRED_ROLE", "finary:access")
+# Optional: restrict the role check to one Zitadel project id. Empty = the role
+# key is accepted from any project the token's user holds it in.
+OAUTH_PROJECT_ID = os.getenv("OAUTH_PROJECT_ID", "")
 MCP_PUBLIC_URL = os.getenv("MCP_PUBLIC_URL", "")
 
 logging.basicConfig(
@@ -1882,12 +1885,16 @@ async def rest_call_tool(request: Request) -> JSONResponse:
 
 
 # ===========================================================================
-# AUTH MIDDLEWARE — copied verbatim from obsidian_mcp.py
+# AUTH MIDDLEWARE — derived from obsidian_mcp.py
 # Dual-mode: legacy API_TOKEN (path prefix or exact bearer match) OR
 # OAuth 2.1 (Zitadel) bearer token validated via userinfo + role check.
+# The role is read from userinfo claims, falling back to the Auth API's
+# ListMyUserGrants (needed for machine-user Personal Access Tokens).
 # ===========================================================================
 
 ROLES_CLAIM = "urn:zitadel:iam:org:project:roles"
+_PROJECT_ROLES_CLAIM_PREFIX = "urn:zitadel:iam:org:project:"
+_PROJECT_ROLES_CLAIM_SUFFIX = ":roles"
 
 _USERINFO_CACHE_TTL = 45
 _userinfo_cache: dict[str, tuple[float, dict | None]] = {}
@@ -1917,6 +1924,76 @@ async def _fetch_userinfo(token: str) -> dict | None:
 
     _userinfo_cache[token_hash] = (now + _USERINFO_CACHE_TTL, userinfo)
     return userinfo
+
+
+def _userinfo_has_role(userinfo: dict) -> bool:
+    """True when userinfo asserts OAUTH_REQUIRED_ROLE.
+
+    Zitadel asserts roles either as the generic `urn:zitadel:iam:org:project:roles`
+    claim or as the project-specific `urn:zitadel:iam:org:project:{id}:roles`
+    claim; both map role keys to {org_id: org_domain}.
+    """
+    for key, value in userinfo.items():
+        if not isinstance(value, dict):
+            continue
+        if key == ROLES_CLAIM:
+            if OAUTH_REQUIRED_ROLE in value:
+                return True
+        elif key.startswith(_PROJECT_ROLES_CLAIM_PREFIX) and key.endswith(_PROJECT_ROLES_CLAIM_SUFFIX):
+            project_id = key[len(_PROJECT_ROLES_CLAIM_PREFIX):-len(_PROJECT_ROLES_CLAIM_SUFFIX)]
+            if OAUTH_PROJECT_ID and project_id != OAUTH_PROJECT_ID:
+                continue
+            if OAUTH_REQUIRED_ROLE in value:
+                return True
+    return False
+
+
+_grants_cache: dict[str, tuple[float, bool]] = {}
+
+
+async def _grants_have_role(token: str) -> bool:
+    """Fallback role check via Zitadel's Auth API (ListMyUserGrants).
+
+    Personal Access Tokens of machine users don't carry project roles in
+    userinfo unless the project asserts them, so we ask Zitadel for the token
+    owner's own grants instead. The call is made with the caller's token.
+    """
+    import hashlib
+    import time
+
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    now = time.monotonic()
+    cached = _grants_cache.get(token_hash)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    allowed = False
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{ZITADEL_ISSUER}/auth/v1/usergrants/me/_search",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                json={"query": {"limit": 100}},
+            )
+        if response.status_code == 200:
+            for grant in response.json().get("result") or []:
+                if OAUTH_PROJECT_ID and grant.get("projectId") != OAUTH_PROJECT_ID:
+                    continue
+                if OAUTH_REQUIRED_ROLE in (grant.get("roleKeys") or grant.get("roles") or []):
+                    allowed = True
+                    break
+        else:
+            log.info("Zitadel grants lookup returned HTTP %s", response.status_code)
+    except (httpx.HTTPError, ValueError):
+        log.warning("Zitadel grants lookup failed", exc_info=True)
+        allowed = False
+
+    _grants_cache[token_hash] = (now + _USERINFO_CACHE_TTL, allowed)
+    return allowed
+
+
+async def _has_required_role(token: str, userinfo: dict) -> bool:
+    return _userinfo_has_role(userinfo) or await _grants_have_role(token)
 
 
 def _protected_resource_metadata_url() -> str:
@@ -1977,8 +2054,7 @@ class AuthMiddleware:
             await self._send_401(send, "invalid_token", "Token is invalid or expired")
             return
 
-        roles = userinfo.get(ROLES_CLAIM) or {}
-        if OAUTH_REQUIRED_ROLE not in roles:
+        if not await _has_required_role(bearer_token, userinfo):
             await self._send_403(send)
             return
 

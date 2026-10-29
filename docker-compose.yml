@@ -7,7 +7,7 @@
 # https://finary-mcp.${DOMAIN} to it with a Let's Encrypt cert.
 #
 # Required .env vars: DOMAIN, FINARY_EMAIL, FINARY_PASSWORD, API_TOKEN
-# Optional OAuth 2.1 (Zitadel) vars: ZITADEL_ISSUER, OAUTH_REQUIRED_ROLE
+# Optional OAuth 2.1 (Zitadel) vars: ZITADEL_ISSUER, OAUTH_REQUIRED_ROLE, OAUTH_PROJECT_ID
 
 services:
   finary-mcp:
@@ -29,6 +29,7 @@ services:
       - MCP_PUBLIC_URL=https://finary-mcp.${DOMAIN}
       - ZITADEL_ISSUER=${ZITADEL_ISSUER:-https://zitadel-k9z6.srv828065.hstgr.cloud}
       - OAUTH_REQUIRED_ROLE=${OAUTH_REQUIRED_ROLE:-finary:access}
+      - OAUTH_PROJECT_ID=${OAUTH_PROJECT_ID:-}
     # Bootstrap: pip install deps, fetch the latest finary_mcp.py from
     # GitHub, exec it. `docker compose restart` = update to whatever's on main.
     # `mcp<2` is pinned: the MCP Python SDK's v2.0.0 removed
