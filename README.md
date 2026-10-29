@@ -126,7 +126,7 @@ git clone https://github.com/seb7152/finary-mcp.git .
 cp .env.example .env
 # Edit .env: DOMAIN, FINARY_EMAIL, FINARY_PASSWORD, API_TOKEN
 # Optional (OAuth 2.1 via Zitadel instead of/alongside API_TOKEN):
-#   ZITADEL_ISSUER, OAUTH_REQUIRED_ROLE
+#   ZITADEL_ISSUER, OAUTH_REQUIRED_ROLE, OAUTH_PROJECT_ID
 ```
 
 Generate a strong API token:
@@ -291,6 +291,22 @@ curl -s -X POST "$BASE/tools/finary_get_value_timeseries" -H "$AUTH" \
 # GET form, token in the path (no headers)
 curl -s "https://finary-mcp.${DOMAIN}/${API_TOKEN}/api/tools/finary_get_account?query=PEA"
 ```
+
+### One token per agent (Zitadel service users)
+
+Rather than sharing `API_TOKEN`, give each agent its own revocable token:
+
+1. In Zitadel, create a **Service User** (e.g. `instinct-agent`).
+2. Under **Authorizations**, grant it the `finary:access` role on the
+   project that defines that role.
+3. On the user, create a **Personal Access Token** with an expiration date.
+4. The agent sends it as `Authorization: Bearer <PAT>`.
+
+Revoke access by deleting the PAT or the service user in Zitadel; nothing
+changes on the server. The server reads the role from userinfo claims and,
+when they are absent (the usual case for PATs), from Zitadel's
+`ListMyUserGrants` API called with the same token. Set `OAUTH_PROJECT_ID` to
+only accept the role from one Zitadel project.
 
 ### When the Finary session expires (`503 session_expired`)
 
